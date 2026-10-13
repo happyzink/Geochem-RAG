@@ -53,9 +53,11 @@ def main() -> int:
 
     config = ProviderConfig.from_env()
     store = LocalStore(args.store)
-    chunks = store.get_chunks()
+    all_chunks = store.get_chunks()
+    chunks = [c for c in all_chunks if c.quality == "ok" and len(c.text.strip()) >= 40]
+    skipped = len(all_chunks) - len(chunks)
     print(f"store={args.store}")
-    print(f"chunks={len(chunks)} sources={len(store.load_sources())}")
+    print(f"chunks={len(chunks)} (skipped {skipped} non-ok/too-short) sources={len(store.load_sources())}")
 
     if not chunks:
         print("NO_CHUNKS: run scripts/import_all_pdfs.py first", file=sys.stderr)

@@ -145,3 +145,29 @@ def test_pages_for_source_groups_without_cross_page(tmp_path: Path):
     pages = store.pages_for_source(source.source_id)
     assert set(pages) == {1, 2}
     assert all(c.pdf_page == page for page, cs in pages.items() for c in cs)
+
+def test_chunking_fingerprint_change_rechunks_same_bytes(tmp_path: Path):
+    store = LocalStore(tmp_path / "processed")
+    source = _source(SHA1)
+    first = store.import_document(source, _chunks(SHA1, [1, 2]), chunking_fingerprint="fp1")
+    assert first.status == "imported"
+    assert store.count_chunks() == 2
+
+    # Same bytes + same fingerprint -> no re-chunk.
+    again = store.import_document(source, _chunks(SHA1, [1, 2]), chunking_fingerprint="fp1")
+    assert again.status == "already_exists"
+    assert store.count_chunks() == 2
+
+    # Same bytes + new fingerprint -> rebuild the evidence set, not silently skip.
+    rebuilt = store.import_document(source, _chunks(SHA1, [1, 2, 3]), chunking_fingerprint="fp2")
+    assert rebuilt.status == "rechunked"
+    assert store.count_chunks() == 3
+
+
+def test_no_fingerprint_preserves_legacy_dedup(tmp_path: Path):
+    store = LocalStore(tmp_path / "processed")
+    source = _source(SHA1)
+    store.import_document(source, _chunks(SHA1, [1, 2]))
+    again = store.import_document(source, _chunks(SHA1, [1, 2, 3]))
+    assert again.status == "already_exists"
+    assert store.count_chunks() == 2

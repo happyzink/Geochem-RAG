@@ -10,6 +10,7 @@ from pypdf import PdfWriter
 from geochem_rag.ingest import (
     assess_page_text,
     chunk_page_text,
+    chunking_fingerprint,
     extract_pages,
     ingest_pdf,
     sha256_file,
@@ -100,6 +101,21 @@ def test_chunk_index_zero_based_and_unique():
 def test_empty_page_yields_no_chunks():
     sha = "e" * 64
     assert chunk_page_text("   ", pdf_page=1, source_sha256=sha) == []
+
+
+def test_oversized_single_paragraph_splits_on_cjk_period():
+    sha = "f" * 64
+    text = "。 ".join(f"这是第{i}个中文句子，用于验证分块不会跨页" for i in range(20))
+    chunks = chunk_page_text(text, pdf_page=3, source_sha256=sha, max_chars=100)
+    assert len(chunks) > 1
+    assert all(c.pdf_page == 3 for c in chunks)
+    again = chunk_page_text(text, pdf_page=3, source_sha256=sha, max_chars=100)
+    assert [c.chunk_id for c in again] == [c.chunk_id for c in chunks]
+
+
+def test_chunking_fingerprint_changes_with_max_chars():
+    assert chunking_fingerprint(max_chars=900) != chunking_fingerprint(max_chars=1200)
+    assert chunking_fingerprint(max_chars=1200) == chunking_fingerprint(max_chars=1200)
 
 
 def test_ingest_pdf_blank_pages_reported(tmp_path: Path):

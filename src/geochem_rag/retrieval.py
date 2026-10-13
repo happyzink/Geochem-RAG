@@ -71,13 +71,15 @@ _GEO_EXPANSIONS: dict[str, tuple[str, ...]] = {
     "加厚下地壳": ("thickened lower crust",),
     "下地壳": ("lower crust",),
     "地壳增厚": ("crustal thickening", "thickened crust"),
-    "地幔源区": ("mantle source", "mantle wedge"),
+    "地幔源区": ("mantle source",),
+    "地幔楔": ("mantle wedge",),
     "源区": ("source region", "source"),
     "亏损地幔": ("depleted mantle",),
     "富集地幔": ("enriched mantle",),
     "软流圈": ("asthenosphere", "asthenospheric"),
     "岩石圈": ("lithosphere", "lithospheric"),
     "地幔柱": ("mantle plume",),
+    "俯冲带": ("subduction zone", "subduction"),
     "俯冲": ("subduction", "subducted"),
     "洋壳": ("oceanic crust",),
     "大陆地壳": ("continental crust",),
@@ -87,9 +89,11 @@ _GEO_EXPANSIONS: dict[str, tuple[str, ...]] = {
     "微量元素": ("trace elements",),
     "稀土元素": ("rare earth elements", "ree"),
     "同位素": ("isotope", "isotopic"),
-    "岩浆": ("magma", "magmatic"),
     "岩浆演化": ("magma evolution", "magmatic evolution"),
     "岩浆混合": ("magma mixing",),
+    "岩浆": ("magma", "magmatic"),
+    "弧岩浆": ("arc magma", "arc magmatism"),
+    "板片断离": ("slab breakoff", "slab detachment"),
     "拉萨地体": ("lhasa terrane", "lhasa"),
     "东天山": ("eastern tianshan", "tianshan"),
 
@@ -109,21 +113,17 @@ _GEO_EXPANSIONS: dict[str, tuple[str, ...]] = {
     "mg#": ("mg number", "magnesium number"),
     "sr/y": ("sry", "sr y ratio"),
     # Reverse / corpus-level bridges (Chinese question ↔ English paper and back).
-    "地壳厚度": ("crustal thickness", "moho depth", "crustal thicknesses"),
-    "青藏": ("tibet", "tibetan", "tibetan plateau", "qinghai-tibet"),
-    "高原": ("plateau", "tibetan plateau"),
+    "地壳厚度": ("crustal thickness", "moho depth"),
+    "青藏高原": ("tibetan plateau", "tibet", "qinghai-tibet"),
+    "青藏": ("tibet", "tibetan"),
+    "高原": ("plateau",),
     "冈底斯": ("gangdese",),
     "喜马拉雅": ("himalaya", "himalayan"),
     "氧逸度": ("oxygen fugacity", "redox", "fO2"),
     "氧化还原": ("redox",),
     "金红石": ("rutile",),
     "地壳生长": ("crustal growth", "continental growth"),
-    "地壳增厚": ("crustal thickening", "crustal thickening"),
-    "俯冲带": ("subduction zone", "subduction"),
     "岛弧": ("island arc", "arc"),
-    "大陆地壳": ("continental crust",),
-    "亏损地幔": ("depleted mantle",),
-    "岩石圈": ("lithosphere",),
     "adakitic": ("埃达克质", "adakite"),
     "crustal thickness": ("地壳厚度",),
     "redox": ("氧化还原", "氧逸度", "oxygen fugacity"),
@@ -156,16 +156,29 @@ class ExpandedQuery:
 
 
 def expand_query(question: str) -> ExpandedQuery:
-    """Add English/abbreviation synonyms without overwriting the question."""
+    """Add English/abbreviation synonyms using longest-match, no overlaps.
+
+    Longer terms are matched first; once a span is consumed, shorter terms
+    that overlap it are skipped (e.g. "超基性" blocks "基性" inside it).
+    """
     lowered = question.lower()
     added: list[str] = []
     matched: list[str] = []
-    for term, synonyms in _GEO_EXPANSIONS.items():
-        if term in lowered:
-            matched.append(term)
-            for synonym in synonyms:
-                if synonym and synonym not in lowered and synonym not in added:
-                    added.append(synonym)
+    consumed: list[tuple[int, int]] = []
+    for term, synonyms in sorted(_GEO_EXPANSIONS.items(), key=lambda kv: -len(kv[0])):
+        start = 0
+        while True:
+            pos = lowered.find(term, start)
+            if pos == -1:
+                break
+            end = pos + len(term)
+            if not any(c_start < end and pos < c_end for c_start, c_end in consumed):
+                matched.append(term)
+                consumed.append((pos, end))
+                for synonym in synonyms:
+                    if synonym and synonym not in lowered and synonym not in added:
+                        added.append(synonym)
+            start = pos + 1
     if not added:
         return ExpandedQuery(question, question, (), tuple(matched))
     return ExpandedQuery(question, question + " " + " ".join(added), tuple(added), tuple(matched))
@@ -348,6 +361,7 @@ class RetrievalTrace:
     rrf_k: int
     candidate_k: int
     top_k: int
+    english_query: str | None = None
     dense_ranking: list[tuple[str, float]] = field(default_factory=list)
     bm25_ranking: list[tuple[str, float]] = field(default_factory=list)
     hits: list[SearchHit] = field(default_factory=list)
@@ -359,6 +373,7 @@ class RetrievalTrace:
             "expanded_query": self.expanded_query,
             "expanded_terms": list(self.expanded_terms),
             "matched_terms": list(self.matched_terms),
+            "english_query": self.english_query,
             "rrf_k": self.rrf_k,
             "candidate_k": self.candidate_k,
             "top_k": self.top_k,
@@ -410,12 +425,21 @@ class Retriever:
         *,
         visibility: str | None = None,
         cache_path: str | Path = "data/index/embeddings.json",
+        quality_ok_only: bool = True,
+        min_chunk_chars: int = 40,
         **kwargs: Any,
     ) -> "Retriever":
         chunks = store.get_chunks()
         if visibility is not None:
             allowed = {s.source_id for s in store.list_sources(visibility)}
             chunks = [c for c in chunks if c.source_id in allowed]
+        if quality_ok_only:
+            # Scanned/garbled/empty pages are diagnostics, not answerable evidence.
+            chunks = [
+                c
+                for c in chunks
+                if c.quality == "ok" and len(c.text.strip()) >= min_chunk_chars
+            ]
         cache = EmbeddingCache(cache_path, _model_name(embedder))
         return cls(chunks, embedder=embedder, cache=cache, **kwargs)
 

@@ -34,7 +34,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from geochem_rag.domain import PageQuality  # noqa: E402
-from geochem_rag.ingest import extract_pages, ingest_pdf, sha256_file  # noqa: E402
+from geochem_rag.ingest import (  # noqa: E402
+    chunking_fingerprint,
+    extract_pages,
+    ingest_pdf,
+    sha256_file,
+)
 from geochem_rag.store import LocalStore  # noqa: E402
 
 PDF_ROOT = ROOT / "PDF"
@@ -68,7 +73,7 @@ def classify_extract_error(exc: BaseException) -> str:
     return "extract_error"
 
 
-def process_one(pdf: Path, store: LocalStore, state: dict, state_path: Path) -> dict:
+def process_one(pdf: Path, store: LocalStore, state: dict, state_path: Path, max_chars: int = 1200) -> dict:
     rel = pdf.relative_to(ROOT).as_posix()
     digest = sha256_file(pdf)
     prior = state["by_sha"].get(digest)
@@ -130,8 +135,8 @@ def process_one(pdf: Path, store: LocalStore, state: dict, state_path: Path) -> 
             save_state(state, state_path)
             return row
 
-        source, chunks, report = ingest_pdf(pdf, visibility="private")
-        result = store.import_document(source, chunks, report)
+        source, chunks, report = ingest_pdf(pdf, visibility="private", max_chars=max_chars)
+        result = store.import_document(source, chunks, report, chunking_fingerprint=chunking_fingerprint(max_chars))
         quality_counts = dict(report.quality_counts)
         empty_pages = quality_counts.get(PageQuality.EMPTY.value, 0)
         scanned_pages = quality_counts.get(PageQuality.SCANNED.value, 0)
@@ -180,6 +185,7 @@ def main() -> int:
     parser.add_argument("--report-only", action="store_true", help="print state summary and exit")
     parser.add_argument("--store", default=str(STORE_ROOT), help="store directory")
     parser.add_argument("--reset-state", action="store_true", help="ignore previous state (keep store)")
+    parser.add_argument("--max-chars", type=int, default=1200, help="page-local chunk max chars")
     args = parser.parse_args()
 
     store_root = Path(args.store)
@@ -208,7 +214,7 @@ def main() -> int:
 
     rows = []
     for i, pdf in enumerate(pdfs, start=1):
-        row = process_one(pdf, store, state, state_path)
+        row = process_one(pdf, store, state, state_path, max_chars=args.max_chars)
         rows.append(row)
         status = row.get("status")
         extra = ""

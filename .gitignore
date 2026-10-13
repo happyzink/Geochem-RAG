@@ -1,4 +1,5 @@
 # Local/private source material and generated indexes
+data/
 data/private/
 PDF/
 data/public/
@@ -18,6 +19,7 @@ eval/results_offline/
 .env.*
 !.env.example
 secrets/
+data/local_settings.json
 
 # Python and notebooks
 .venv/
@@ -32,6 +34,13 @@ __pycache__/
 _a.log
 _t.log
 .ipynb_checkpoints/
+.review_checks/
+*.egg-info/
+
+# Local corpus reports and one-off private diagnostic scripts
+docs/WAVE0_LOCAL_CORPUS_ACCEPTANCE.md
+docs/WAVE0_LOCAL_HANDOFF.md
+scripts/_*.py
 
 # OS and editors
 .DS_Store

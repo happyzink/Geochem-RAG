@@ -1,5 +1,7 @@
 # QoderCN 执行任务书
 
+> 2026-10-12：归档为历史交接资料，后续前端、启动与包装工作全部转交 CODEartsAgent，不再向 QoderCN 派新任务。以下旧范围限制不约束 CODEartsAgent。当前入口：`docs/agents/CODEartsAgent.md`。
+
 状态：按用户后续开发指令执行。先读根目录 `AGENTS.md`、设计、执行计划和 `docs/CONTRACT_MIGRATION_0.2.md`。可在后端开发时准备 UI 布局；最终接线等 CODEartsAgent 的接口稳定。不得自行在线下载文献。
 
 ## 负责范围

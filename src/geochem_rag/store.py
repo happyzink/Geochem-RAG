@@ -32,6 +32,32 @@ class LocalStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.sources_path = self.root / "sources.jsonl"
         self.chunks_path = self.root / "chunks.jsonl"
+        self.config_path = self.root / "chunking.json"
+
+    # --- chunking fingerprint --------------------------------------
+    def _read_chunking_config(self) -> dict[str, str]:
+        if not self.config_path.exists():
+            return {}
+        try:
+            payload = json.loads(self.config_path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _write_chunking_config(self, config: dict[str, str]) -> None:
+        tmp = self.config_path.with_suffix(self.config_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(self.config_path)
+
+    def _fingerprint_changed(self, source_id: str, fingerprint: str) -> bool:
+        return self._read_chunking_config().get(source_id) != fingerprint
+
+    def _record_fingerprint(self, source_id: str, fingerprint: str) -> None:
+        config = self._read_chunking_config()
+        if config.get(source_id) == fingerprint:
+            return
+        config[source_id] = fingerprint
+        self._write_chunking_config(config)
 
     # --- IO helpers -------------------------------------------------
     def _read_jsonl(self, path: Path) -> Iterator[dict]:
@@ -112,11 +138,16 @@ class LocalStore:
         source: Source,
         chunks: Sequence[EvidenceChunk],
         report: IngestReport | None = None,
+        *,
+        chunking_fingerprint: str | None = None,
     ) -> ImportResult:
         """Import with SHA-256 dedup.
 
         Same SHA-256 already stored -> status 'already_exists' (no duplicate chunks).
         Same source_id with a different SHA -> old chunks invalidated ('replaced').
+        ``chunking_fingerprint`` marks the chunking-rule version; when it differs
+        from the stored marker for the same bytes, the evidence set is re-chunked
+        ('rechunked') instead of being silently skipped by SHA dedup.
         """
         existing = self.get_source_by_sha(source.sha256)
         if existing is not None:
@@ -126,6 +157,15 @@ class LocalStore:
             if existing.source_id == source.source_id and existing != source:
                 self.upsert_source(source)
                 status = "metadata_updated"
+            if (
+                chunking_fingerprint is not None
+                and self._fingerprint_changed(existing.source_id, chunking_fingerprint)
+            ):
+                # Same bytes, new chunking rules: rebuild the evidence set rather
+                # than silently keeping stale chunks.
+                self.replace_chunks(existing.source_id, chunks)
+                self._record_fingerprint(existing.source_id, chunking_fingerprint)
+                status = "rechunked"
             return ImportResult(
                 status=status,
                 source_id=existing.source_id,
@@ -142,6 +182,8 @@ class LocalStore:
 
         self.upsert_source(source)
         self.replace_chunks(source.source_id, chunks)
+        if chunking_fingerprint is not None:
+            self._record_fingerprint(source.source_id, chunking_fingerprint)
         return ImportResult(
             status=status,
             source_id=source.source_id,

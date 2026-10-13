@@ -14,8 +14,10 @@ Evidence-grounded literature Q&A for rock geochemistry. Retrieves evidence from 
 - Dense + BM25 + RRF 混合检索，地学缩写词典扩展（`retrieval.py`）
 - 证据约束回答与引用校验（`answering.py`）
 - 固定题集评估脚本与指标计算（`evaluation.py`）
-- Streamlit 界面，展示回答状态、引用、证据片段与隐私说明（`app.py`）
-- 离线演示模式（无需 API 密钥）
+- Streamlit 界面：知识库/设置按钮、聊天界面、引用卡片与隐私说明（`app.py`）
+- 仅联网运行，缺密钥/语料/索引时明确报错，不降级到模板回答
+- Windows 根目录双击 `启动GeoChem-RAG.bat` 启动并自动打开浏览器
+- 设置中获取/刷新模型目录、选择对话模型并保存偏好；思考控制按模型实际支持能力显示（`model_settings.py`）
 - 本地 `PDF/` 全量续跑导入与独立索引脚本（私有语料留在本机）
 
 **尚未完成：**
@@ -92,7 +94,7 @@ GEOCHEM_CHAT_PROVIDER=deepseek
 GEOCHEM_EMBEDDING_PROVIDER=siliconflow
 ```
 
-**注意：** `.env` 文件已被 `.gitignore` 忽略，不会被提交到 Git。如果你没有 API 密钥，系统会自动切换到离线演示模式（使用占位符提供程序，回答为模板文本）。
+**注意：** `.env` 文件已被 `.gitignore` 忽略，不会被提交到 Git。应用仅联网运行，缺少密钥时会显示明确的配置错误，不会降级到模板回答。
 
 ### 导入本地 PDF
 
@@ -163,30 +165,35 @@ set -a && source .env && set +a
 .\.venv\Scripts\python.exe scripts\build_full_index.py
 ```
 
-### 启动 Streamlit 界面
+### 启动应用
 
-**Windows PowerShell：**
+**停止方法：** 在运行终端按 `Ctrl+C`，或直接关闭终端窗口。
+
+**Windows 双击启动（推荐）：** 完成首次配置（`.env` + 导入 PDF + 构建索引）后，双击项目根目录的 `启动GeoChem-RAG.bat`。脚本自动加载 `.env`、校验配置、启动 Streamlit 并打开浏览器。重复双击会复用已运行的实例。
+
+**命令行启动：**
 
 ```powershell
-.\.venv\Scripts\streamlit.exe run src/geochem_rag/app.py
+# Windows
+.\.venv\Scripts\python.exe scripts\run_streamlit_online.py
 ```
 
-**Linux / git-bash：**
-
 ```bash
-.venv/bin/streamlit run src/geochem_rag/app.py
+# Linux / git-bash
+.venv/bin/python scripts/run_streamlit_online.py
 ```
 
 浏览器会自动打开 `http://localhost:8501`。界面包括：
 
-- 问题输入框与三个固定演示问题按钮
-- 回答状态横幅（answered / insufficient_evidence / error）
-- 可展开的引用卡片：论文标题、PDF 页码、证据片段、公开原文链接
-- 侧边栏：检索配置、来源列表、隐私说明
+- 聊天输入框与示例问题折叠区
+- **知识库**按钮：来源列表、有效证据块数、按标题筛选
+- **设置**按钮：检索方式（hybrid/dense_only/bm25_only）、top-k、通用背景补充开关
+- 回答下方可展开的引用卡片：论文标题、PDF 页码、证据片段
+- 通用背景补充折叠区（标注"未经本地文献核验"）
 
-如果没有 API 密钥，界面会自动切换到离线演示模式，侧边栏会显示警告。
+缺少密钥、语料或索引时，界面显示明确的错误提示，不产生模板回答。
 
-使用 `.env` 中的两套在线密钥启动全量库，可运行 `python scripts/run_streamlit_online.py`（Windows 虚拟环境下用 `.\.venv\Scripts\python.exe` 代替 `python`）。存在全量库时，界面默认选用它及对应的向量缓存；`GEOCHEM_STORE` 和 `GEOCHEM_EMBEDDING_CACHE` 可覆盖默认路径。
+`GEOCHEM_STORE` 和 `GEOCHEM_EMBEDDING_CACHE` 环境变量可覆盖默认的语料和缓存路径。
 
 ### 运行固定演示
 
@@ -238,13 +245,6 @@ set -a && source .env && set +a
 - `summary_<stamp>.json`：指标汇总与 manifest
 - `review_sheet.jsonl`：人工标注模板
 
-**离线自检（无需 API 密钥）：**
-
-```bash
-.venv/bin/python scripts/run_evaluation.py --offline --results eval/results_offline
-```
-
-离线模式使用占位符提供程序，用于验证流程贯通，**不代表真实检索质量**。
 
 ## 评估结果 / Evaluation Results
 
@@ -274,6 +274,8 @@ GeoChem-RAG/
 ├── pyproject.toml               # 依赖与构建配置
 ├── .env.example                 # 环境变量模板
 ├── .gitignore                   # Git 忽略规则
+├── 启动GeoChem-RAG.bat          # Windows 双击启动入口
+├── start.bat / start.sh         # 兼容包装启动脚本
 │
 ├── PDF/                         # 用户本地语料（gitignore）
 ├── data/
@@ -284,26 +286,26 @@ GeoChem-RAG/
 │
 ├── src/geochem_rag/
 │   ├── domain.py                # 数据契约（Source, EvidenceChunk, SearchHit, Answer）
-│   ├── ingest.py                # PDF 逐页解析与分块
-│   ├── store.py                 # 本地持久化与去重
+│   ├── ingest.py                # PDF 逐页解析与中英文句界分块
+│   ├── store.py                 # 本地持久化、去重与 chunking fingerprint
 │   ├── providers.py             # SiliconFlow / DeepSeek API 适配
-│   ├── retrieval.py             # Dense + BM25 + RRF 检索
-│   ├── answering.py             # 证据约束回答与引用校验
+│   ├── retrieval.py             # Dense + BM25 + RRF 检索 + 坏文本过滤
+│   ├── answering.py             # 证据约束回答、引用校验与通用背景补充
 │   ├── evaluation.py            # 评估脚本与指标计算
-│   ├── offline.py               # 离线占位符提供程序
-│   └── app.py                   # Streamlit 界面
+│   ├── offline.py               # 占位符提供程序（仅测试用）
+│   └── app.py                   # Streamlit 界面（仅联网）
 │
 ├── scripts/
 │   ├── build_index.py           # 构建嵌入索引
 │   ├── import_all_pdfs.py       # 全量私有 PDF 可续跑导入
 │   ├── build_full_index.py      # 全量库可续跑嵌入索引
-│   ├── run_streamlit_online.py  # 从 .env 启动在线界面
+│   ├── run_streamlit_online.py  # 联网启动编排（校验 + 启动 + 开浏览器）
 │   ├── run_evaluation.py        # 运行评估
 │   ├── run_demo.py              # 固定三题演示
 │   ├── run_online_e2e.py        # 单题在线端到端测试
 │   └── run_import_check.py      # 导入验证脚本
 │
-├── tests/                       # 单元测试（67 项）
+├── tests/                       # 自动测试（2026-10-12 复跑 175 项通过）
 ├── eval/
 │   ├── questions.jsonl          # 固定题集（40 题）
 │   └── results/                 # 评估结果（gitignore）
@@ -324,7 +326,7 @@ GeoChem-RAG/
 - **API 密钥：** 只从环境变量读取，不显示在界面中，不记录在日志中。
 - **公开仓库：** 不包含私有 PDF、API 密钥、嵌入索引或私有检索日志。
 
-Streamlit 界面的侧边栏有详细的隐私说明。
+Streamlit 界面底部有数据流说明（建索引文本发送至 SiliconFlow，问题与证据片段发送至 DeepSeek）。
 
 ## 文档链接 / Documentation
 
@@ -355,13 +357,15 @@ Streamlit 界面的侧边栏有详细的隐私说明。
 运行上述命令验证当前测试，覆盖：
 
 - `domain.py`：数据契约校验
-- `ingest.py`：PDF 抽取与分块
-- `store.py`：持久化与去重
+- `ingest.py`：PDF 抽取、中英文句界分块与 chunking fingerprint
+- `store.py`：持久化、去重与 fingerprint 变更检测
 - `providers.py`：API 适配与错误处理
-- `retrieval.py`：检索与查询扩展
-- `answering.py`：引用校验与拒答
+- `retrieval.py`：检索、查询扩展与坏文本过滤
+- `answering.py`：引用校验、拒答与零证据通用背景
 - `evaluation.py`：指标计算
-- `offline.py`：离线占位符
+- `offline.py`：占位符提供程序（仅测试用）
+- `app.py`：界面辅助函数与初始化校验
+- `online_startup`：联网启动校验（缺 key/语料/索引检测）
 
 ## 许可证 / License
 
@@ -373,4 +377,4 @@ Streamlit 界面的侧边栏有详细的隐私说明。
 
 ---
 
-**最后更新：** 2026-09-28。Wave 3（QoderCN）完成 Streamlit 界面、演示脚本与文档。
+**最后更新：** 2026-10-12。CODEartsAgent 统一开发：仅联网运行、首页简化（知识库/设置按钮）、双击启动、分块改进与坏文本过滤。

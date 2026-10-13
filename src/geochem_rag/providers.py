@@ -79,6 +79,9 @@ class ProviderConfig:
     backoff_seconds: float = 1.5
     disable_proxy: bool = False
     credential_name: str = "SILICONFLOW_API_KEY"
+    # Reasoning/thinking calls can take substantially longer than normal
+    # chat calls; bounded separately so the app never waits indefinitely.
+    thinking_timeout: float = 180.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> "ProviderConfig":
@@ -117,6 +120,7 @@ class ProviderConfig:
             max_retries=pick_int("GEOCHEM_API_MAX_RETRIES", 2),
             backoff_seconds=pick_float("GEOCHEM_API_BACKOFF", 1.5),
             disable_proxy=disable_proxy,
+            thinking_timeout=pick_float("GEOCHEM_THINKING_TIMEOUT", 180.0),
         )
 
     def require_key(self) -> str:
@@ -149,6 +153,10 @@ class ChatResult:
     usage: dict[str, Any] = field(default_factory=dict)
     finish_reason: str | None = None
     latency_seconds: float = 0.0
+    # Chain-of-thought / reasoning content returned by thinking models.
+    # Kept separate from ``text``: it is never parsed as the structured answer
+    # and never used as citation evidence.
+    reasoning: str | None = None
 
 
 @runtime_checkable
@@ -196,6 +204,8 @@ class SiliconFlowClient:
         opener: Callable[..., Any] | None = None,
         sleeper: Callable[[float], None] | None = None,
         embedding_batch_size: int = 32,
+        thinking_body: Mapping[str, Any] | None = None,
+        thinking_active: bool = False,
     ) -> None:
         self.config = config or ProviderConfig.from_env()
         if opener is not None:
@@ -208,26 +218,37 @@ class SiliconFlowClient:
             self._opener = urllib.request.urlopen
         self._sleep = sleeper or time.sleep
         self.embedding_batch_size = embedding_batch_size
+        # Provider-specific, top-level reasoning controls already mapped for
+        # the bound model (e.g. DeepSeek ``thinking``/``reasoning_effort`` or
+        # SiliconFlow ``enable_thinking``/``thinking_budget``). Never contains
+        # model ids, messages, secrets or private text.
+        self.thinking_body: dict[str, Any] = dict(thinking_body or {})
+        self.thinking_active = thinking_active
 
     # --- low level -------------------------------------------------
-    def _post(self, path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         key = self.config.require_key()
         url = f"{self.config.base_url}{path}"
-        body = json.dumps(payload).encode("utf-8")
-        headers = {
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
         attempt = 0
         last_error: ProviderError | None = None
         while attempt <= self.config.max_retries:
             attempt += 1
             try:
                 request = urllib.request.Request(
-                    url, data=body, headers=headers, method="POST"
+                    url, data=body, headers=headers, method=method
                 )
-                with self._opener(request, timeout=self.config.timeout) as response:
+                with self._opener(request, timeout=timeout or self.config.timeout) as response:
                     raw = response.read()
                 try:
                     data = json.loads(raw.decode("utf-8"))
@@ -296,6 +317,12 @@ class SiliconFlowClient:
         assert last_error is not None
         raise last_error
 
+    def _post(self, path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+        return self._request("POST", path, payload)
+
+    def _get(self, path: str, *, timeout: float | None = None) -> dict[str, Any]:
+        return self._request("GET", path, timeout=timeout)
+
     # --- public API ------------------------------------------------
     def chat(
         self,
@@ -314,8 +341,19 @@ class SiliconFlowClient:
             payload["max_tokens"] = max_tokens
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
+        # Model-specific reasoning controls are merged at the top level of the
+        # JSON body (NOT nested under an extra_body layer, which is an SDK-only
+        # concept). Core keys are never overridable through thinking_body.
+        for key, value in self.thinking_body.items():
+            if key not in ("model", "messages", "temperature", "response_format"):
+                payload[key] = value
         started = time.time()
-        data = self._post("/chat/completions", payload)
+        timeout = (
+            self.config.thinking_timeout if self.thinking_active else self.config.timeout
+        )
+        data = self._request(
+            "POST", "/chat/completions", payload, timeout=timeout
+        )
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
             raise ProviderError(
@@ -323,7 +361,17 @@ class SiliconFlowClient:
             )
         message = choices[0].get("message") or {}
         text = message.get("content")
-        if not isinstance(text, str):
+        reasoning = message.get("reasoning_content")
+        if not isinstance(reasoning, str) or not reasoning.strip():
+            reasoning = None
+        if not isinstance(text, str) or not text.strip():
+            # A thinking model may finish a turn having produced only
+            # reasoning_content. That is never a valid structured answer.
+            if reasoning is not None:
+                raise ProviderError(
+                    KIND_BAD_RESPONSE,
+                    "chat response contained only reasoning content, no answer",
+                )
             raise ProviderError(
                 KIND_BAD_RESPONSE, "chat response has no text content"
             )
@@ -333,7 +381,16 @@ class SiliconFlowClient:
             usage=dict(data.get("usage") or {}),
             finish_reason=choices[0].get("finish_reason"),
             latency_seconds=time.time() - started,
+            reasoning=reasoning,
         )
+
+    def get_models(self, sub_type: str = "chat") -> list[dict[str, Any]]:
+        """Fetch the raw model catalog. SiliconFlow groups by ``sub_type``."""
+        data = self._get(f"/models?sub_type={sub_type}")
+        items = data.get("data")
+        if not isinstance(items, list):
+            raise ProviderError(KIND_BAD_RESPONSE, "model catalog has unexpected shape")
+        return items
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         if not texts:
@@ -375,12 +432,24 @@ class DeepSeekChatClient(SiliconFlowClient):
         *,
         opener: Callable[..., Any] | None = None,
         sleeper: Callable[[float], None] | None = None,
+        thinking_body: Mapping[str, Any] | None = None,
+        thinking_active: bool = False,
     ) -> None:
         super().__init__(
             config or ProviderConfig.from_deepseek_env(),
             opener=opener,
             sleeper=sleeper,
+            thinking_body=thinking_body,
+            thinking_active=thinking_active,
         )
+
+    def get_models(self, sub_type: str = "chat") -> list[dict[str, Any]]:
+        """DeepSeek's catalog endpoint takes no ``sub_type`` parameter."""
+        data = self._get("/models")
+        items = data.get("data")
+        if not isinstance(items, list):
+            raise ProviderError(KIND_BAD_RESPONSE, "model catalog has unexpected shape")
+        return items
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         raise ProviderError(

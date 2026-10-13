@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from .domain import Answer, AnswerStatus, Citation, EvidenceChunk, SearchHit, Source
 from .providers import ChatProvider, ProviderError
@@ -39,6 +39,16 @@ SYSTEM_PROMPT = (
     "part of the question, answer that part with citations and explicitly list "
     "which aspects remain unsupported by the evidence. If the evidence supports "
     "nothing, refuse. Never invent a chunk id, DOI, age, or value. "
+    "When the question is in Chinese, answer in natural Chinese following "
+    "Chinese academic writing conventions: give the direct conclusion first, "
+    "then explain the basis, mechanism, and limitations. Use consistent Chinese "
+    "terminosity throughout; on first use of a term, give '中文名（English term）' "
+    "and do not repeat the English afterwards. Do not mechanically translate "
+    "every evidence block sentence-by-sentence. Preserve evidence strength: "
+    "may/suggest/consistent with/not/except and conditional qualifiers must not "
+    "be lost or strengthened in the Chinese summary; never convert correlation "
+    "into causation. If a professional term's meaning is uncertain or sources "
+    "conflict, say so directly rather than smoothing over the gap. "
     "You must reply with a single JSON object and nothing else, with keys: "
     '"status" (either "answered" or "insufficient_evidence"), "answer" '
     "(the answer text, in the language of the question; when partially "
@@ -54,7 +64,9 @@ _EXTENDED_SYSTEM_PROMPT = (
     "the evidence. Keep it strictly separate from paper-supported claims. "
     "Put it only in the JSON key 'extended_explanation' (string or null). "
     "Never attach citations to that background. Never invent sources, DOIs, "
-    "ages, or numeric values in any field."
+    "ages, or numeric values in any field. "
+    "When the question is in Chinese, write the extended explanation in Chinese "
+    "and clearly label it as general knowledge not verified against local papers."
 )
 
 _USER_TEMPLATE = """QUESTION:
@@ -64,6 +76,21 @@ EVIDENCE:
 {evidence}
 
 Return the JSON object now."""
+
+_NO_EVIDENCE_SYSTEM_PROMPT = (
+    "You are a rock-geochemistry literature assistant. The local literature "
+    "corpus does NOT contain evidence for the user's question. You may give at "
+    "most a short general background explanation (2-4 sentences) of the concept "
+    "only. This is general knowledge and has NOT been verified against local "
+    "papers — say so. Never invent a source, DOI, page number, age, isotope "
+    "value, or a specific finding of a named paper. If you cannot give a "
+    "reliable general explanation, say so. "
+    "When the question is in Chinese, respond in natural Chinese. Use "
+    "'中文名（English term）' on first use of technical terms. Do not invent "
+    "specific values, ages, or conclusions. "
+    "Reply with a single JSON object and "
+    'nothing else: {"answer": "<short general explanation>"}.'
+)
 
 
 @dataclass(frozen=True)
@@ -182,6 +209,7 @@ class EvidenceAnswerer:
         max_evidence_chars: int = DEFAULT_MAX_EVIDENCE_CHARS,
         snippet_chars: int = DEFAULT_SNIPPET_CHARS,
         visibility: str | None = None,
+        model_meta: Mapping[str, Any] | None = None,
     ) -> None:
         self.store = store
         self.chat_provider = chat_provider
@@ -189,6 +217,11 @@ class EvidenceAnswerer:
         self.max_evidence_chars = max_evidence_chars
         self.snippet_chars = snippet_chars
         self.visibility = visibility
+        # Bound at construction so every answer (main and zero-evidence
+        # supplement) records the provider/requested model/thinking controls
+        # actually in force. Stored per answer, so history keeps the labels
+        # from when the answer was produced.
+        self.model_meta: dict[str, Any] = dict(model_meta or {})
 
     def answer(
         self,
@@ -217,8 +250,14 @@ class EvidenceAnswerer:
             "evidence_truncated": truncated,
             "allow_extended": allow_extended,
             "evidence": [item.to_dict() for item in evidence],
+            # Fixed at call time; never rewritten when the model is switched.
+            "provider": self.model_meta.get("provider"),
+            "requested_model": self.model_meta.get("requested_model"),
+            "thinking": self.model_meta.get("thinking"),
         }
         if not evidence:
+            if allow_extended:
+                return self._extended_only_answer(question, base_meta)
             return Answer(
                 status=AnswerStatus.INSUFFICIENT_EVIDENCE.value,
                 text="证据不足：本次检索没有可用于回答的证据块。",
@@ -261,6 +300,7 @@ class EvidenceAnswerer:
             "model": result.model,
             "usage": result.usage,
             "latency_seconds": result.latency_seconds,
+            "reasoning_returned": result.reasoning is not None,
         }
         parsed = _extract_json_object(result.text)
         if parsed is None:
@@ -352,6 +392,58 @@ class EvidenceAnswerer:
             evidence=sorted(evidence_ids),
             question=question,
             meta=meta,
+        )
+
+    def _extended_only_answer(self, question: str, base_meta: dict[str, Any]) -> Answer:
+        """Zero-hit path: a short, clearly-labelled general background only.
+
+        No evidence is passed to the model, no citation is possible, and the
+        result is always ``insufficient_evidence``. The background is stored in
+        ``meta.extended_explanation`` and marked as not locally verified.
+        """
+        try:
+            result = self.chat_provider.chat(
+                [
+                    {"role": "system", "content": _NO_EVIDENCE_SYSTEM_PROMPT},
+                    {"role": "user", "content": f"QUESTION:\n{question.strip()}\n\nReturn the JSON object now."},
+                ],
+                temperature=0.0,
+                json_mode=True,
+            )
+        except ProviderError as exc:
+            return Answer(
+                status=AnswerStatus.ERROR.value,
+                text=(
+                    "生成失败：在线模型调用出错，未产生地学结论。"
+                    f"错误类型：{exc.kind}。请检查配置或稍后重试。"
+                ),
+                citations=[],
+                evidence=[],
+                question=question,
+                meta={**base_meta, "reason": "provider_error", "error": exc.to_dict()},
+            )
+
+        parsed = _extract_json_object(result.text)
+        explanation: str | None = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("answer"), str):
+            explanation = parsed["answer"].strip() or None
+        return Answer(
+            status=AnswerStatus.INSUFFICIENT_EVIDENCE.value,
+            text=(
+                "本地文献未覆盖该问题，本次无可引用的证据。"
+                + ("以下为简短通用背景（未经本地文献核验）。" if explanation else "")
+            ),
+            citations=[],
+            evidence=[],
+            question=question,
+            meta={
+                **base_meta,
+                "model": result.model,
+                "usage": result.usage,
+                "reason": "no_evidence_extended",
+                "reasoning_returned": result.reasoning is not None,
+                "extended_explanation": explanation,
+            },
         )
 
 

@@ -144,3 +144,47 @@ def test_embedding_cache_reuses_vectors(tmp_path):
     second = VocabEmbedder()
     Retriever(chunks, embedder=second, cache=EmbeddingCache(cache_path, "VocabEmbedder"))
     assert second.calls == 0
+
+def test_from_store_filters_non_ok_chunks(tmp_path):
+    from geochem_rag.domain import Source
+    from geochem_rag.store import LocalStore
+
+    store = LocalStore(tmp_path / "s")
+    source = Source(
+        source_id="src_a",
+        title="T",
+        authors=["A"],
+        year=2022,
+        doi_or_url="https://e.org/x",
+        license="CC BY 4.0",
+        license_url="https://e.org/l",
+        sha256=SHA,
+        visibility="public",
+        download_date="2026-09-28",
+    )
+    ok = make_chunk("chk_ok", "adakite petrogenesis in the gangdese arc of southern tibet", page=1)
+    bad = EvidenceChunk(
+        chunk_id="chk_bad",
+        source_id="src_a",
+        pdf_page=2,
+        text="garbled � garbage",
+        section=None,
+        quality="garbled",
+        chunk_index=1,
+        sha256=SHA,
+    )
+    short = EvidenceChunk(
+        chunk_id="chk_short",
+        source_id="src_a",
+        pdf_page=3,
+        text="x",
+        section=None,
+        quality="ok",
+        chunk_index=2,
+        sha256=SHA,
+    )
+    store.import_document(source, [ok, bad, short])
+    retriever = Retriever.from_store(
+        store, VocabEmbedder(), cache_path=str(tmp_path / "emb.json")
+    )
+    assert {c.chunk_id for c in retriever.chunks} == {"chk_ok"}

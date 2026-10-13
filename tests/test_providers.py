@@ -239,3 +239,182 @@ def test_list_available_models_returns_ids():
     finally:
         providers.urllib.request.urlopen = original
     assert ids == ["m1", "m2"]
+
+
+# ---------------------------------------------------------------------------
+# Real thinking controls and reasoning_content
+# ---------------------------------------------------------------------------
+
+
+def reasoning_payload(content: str | None, reasoning: str | None = None) -> bytes:
+    return json.dumps(
+        {
+            "model": "test-chat",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": content,
+                        "reasoning_content": reasoning,
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"total_tokens": 5},
+        }
+    ).encode("utf-8")
+
+
+def test_siliconflow_thinking_body_is_top_level_and_extends_timeout():
+    captured = {}
+
+    def opener(request, timeout):
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return FakeResponse(chat_payload("ok"))
+
+    client = SiliconFlowClient(
+        make_config(timeout=5.0, thinking_timeout=180.0),
+        opener=opener,
+        thinking_body={"enable_thinking": True, "thinking_budget": 8192},
+        thinking_active=True,
+    )
+    client.chat([{"role": "user", "content": "hi"}])
+    payload = captured["payload"]
+    assert payload["enable_thinking"] is True
+    assert payload["thinking_budget"] == 8192
+    assert "extra_body" not in payload
+    assert captured["timeout"] == 180.0
+
+
+def test_thinking_inactive_keeps_normal_timeout():
+    captured = {}
+
+    def opener(request, timeout):
+        captured["timeout"] = timeout
+        return FakeResponse(chat_payload("ok"))
+
+    client = SiliconFlowClient(
+        make_config(timeout=5.0, thinking_timeout=180.0),
+        opener=opener,
+        thinking_body={"enable_thinking": False},
+        thinking_active=False,
+    )
+    client.chat([{"role": "user", "content": "hi"}])
+    assert captured["timeout"] == 5.0
+
+
+def test_deepseek_thinking_body_is_top_level():
+    captured = {}
+
+    def opener(request, timeout):
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(chat_payload("ok"))
+
+    config = ProviderConfig.from_deepseek_env(
+        {"DEEPSEEK_API_KEY": "deepseek-secret"}
+    )
+    client = DeepSeekChatClient(
+        config,
+        opener=opener,
+        thinking_body={"thinking": {"type": "enabled"}, "reasoning_effort": "max"},
+        thinking_active=True,
+    )
+    client.chat([{"role": "user", "content": "hi"}])
+    payload = captured["payload"]
+    assert payload["thinking"] == {"type": "enabled"}
+    assert payload["reasoning_effort"] == "max"
+    assert "extra_body" not in payload
+
+
+def test_thinking_body_cannot_override_core_keys():
+    captured = {}
+
+    def opener(request, timeout):
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse(chat_payload("ok"))
+
+    client = SiliconFlowClient(
+        make_config(),
+        opener=opener,
+        thinking_body={"model": "forged", "messages": []},
+        thinking_active=True,
+    )
+    client.chat([{"role": "user", "content": "hi"}])
+    assert captured["payload"]["model"] == "test-chat"
+    assert captured["payload"]["messages"] == [{"role": "user", "content": "hi"}]
+
+
+def test_reasoning_content_is_separated_from_answer():
+    client = SiliconFlowClient(
+        make_config(),
+        opener=lambda request, timeout: FakeResponse(
+            reasoning_payload("最终答案", "思考过程内容")
+        ),
+    )
+    result = client.chat([{"role": "user", "content": "hi"}])
+    assert result.text == "最终答案"
+    assert result.reasoning == "思考过程内容"
+
+
+def test_response_without_reasoning_has_none():
+    client = SiliconFlowClient(
+        make_config(), opener=lambda request, timeout: FakeResponse(chat_payload("ok"))
+    )
+    result = client.chat([{"role": "user", "content": "hi"}])
+    assert result.reasoning is None
+
+
+def test_only_reasoning_no_answer_is_bad_response():
+    client = SiliconFlowClient(
+        make_config(),
+        opener=lambda request, timeout: FakeResponse(
+            reasoning_payload("", "只有思考没有回答")
+        ),
+    )
+    with pytest.raises(ProviderError) as excinfo:
+        client.chat([{"role": "user", "content": "hi"}])
+    assert excinfo.value.kind == KIND_BAD_RESPONSE
+    assert "reasoning" in str(excinfo.value)
+
+
+def test_siliconflow_get_models_uses_chat_subtype():
+    seen = {}
+
+    def opener(request, timeout):
+        seen["url"] = request.full_url
+        seen["method"] = request.get_method()
+        return FakeResponse(json.dumps({"data": [{"id": "m1"}]}).encode("utf-8"))
+
+    client = SiliconFlowClient(make_config(), opener=opener)
+    items = client.get_models()
+    assert items == [{"id": "m1"}]
+    assert seen["method"] == "GET"
+    assert seen["url"] == "https://api.siliconflow.cn/v1/models?sub_type=chat"
+
+    seen.clear()
+    client.get_models("embedding")
+    assert seen["url"] == "https://api.siliconflow.cn/v1/models?sub_type=embedding"
+
+
+def test_deepseek_get_models_has_no_subtype_and_is_get():
+    seen = {}
+
+    def opener(request, timeout):
+        seen["url"] = request.full_url
+        seen["method"] = request.get_method()
+        return FakeResponse(json.dumps({"data": [{"id": "deepseek-flash"}]}).encode("utf-8"))
+
+    config = ProviderConfig.from_deepseek_env({"DEEPSEEK_API_KEY": "k"})
+    client = DeepSeekChatClient(config, opener=opener)
+    items = client.get_models()
+    assert items[0]["id"] == "deepseek-flash"
+    assert seen["method"] == "GET"
+    assert seen["url"] == "https://api.deepseek.com/models"
+
+
+def test_thinking_timeout_read_from_env():
+    config = ProviderConfig.from_env(
+        {"SILICONFLOW_API_KEY": "k", "GEOCHEM_THINKING_TIMEOUT": "42"}
+    )
+    assert config.thinking_timeout == 42.0

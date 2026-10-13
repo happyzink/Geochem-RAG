@@ -191,3 +191,29 @@ def test_build_evidence_respects_visibility_filter(store):
         visibility="public",
     )
     assert [item.chunk_id for item in items] == ["chk_p0003_c000"]
+
+def test_no_evidence_extended_gives_labelled_background(store):
+    chat = FakeChat(reply='{"answer": "Generally, adakites are intermediate-felsic rocks."}')
+    answer = EvidenceAnswerer(store, chat).answer("什么是埃达克岩？", [], allow_extended=True)
+    assert answer.status == AnswerStatus.INSUFFICIENT_EVIDENCE.value
+    assert answer.citations == []
+    assert answer.evidence == []
+    assert answer.meta["reason"] == "no_evidence_extended"
+    assert answer.meta["extended_explanation"] is not None
+    assert "未经本地文献核验" in answer.text
+
+
+def test_no_evidence_extended_off_does_not_call_model(store):
+    chat = FakeChat(reply="{}")
+    answer = EvidenceAnswerer(store, chat).answer("什么是埃达克岩？", [], allow_extended=False)
+    assert answer.status == AnswerStatus.INSUFFICIENT_EVIDENCE.value
+    assert answer.meta["reason"] == "no_evidence"
+    assert chat.calls == []
+
+
+def test_no_evidence_extended_provider_error_is_error(store):
+    chat = FakeChat(error=ProviderError(KIND_TIMEOUT, "timeout", retryable=True))
+    answer = EvidenceAnswerer(store, chat).answer("q", [], allow_extended=True)
+    assert answer.status == AnswerStatus.ERROR.value
+    assert answer.citations == []
+    assert answer.meta["error"]["kind"] == KIND_TIMEOUT

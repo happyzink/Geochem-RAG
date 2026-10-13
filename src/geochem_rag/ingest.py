@@ -46,6 +46,12 @@ _SECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 _HEADING_RE = re.compile(r"^\s*(?:\d+(?:\.\d+)*)\.?\s+[A-Z][^\n]{2,80}$")
 
+# Sentence boundary for oversized-paragraph splitting. Includes CJK full stops.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s+")
+
+# Bump when the chunking algorithm changes materially; drives the fingerprint.
+_CHUNKING_RULE_VERSION = 2
+
 
 @dataclass(frozen=True)
 class PageRecord:
@@ -74,6 +80,7 @@ class IngestReport:
     quality_counts: dict[str, int]
     chunk_count: int
     warnings: list[str] = field(default_factory=list)
+    chunking_fingerprint: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -85,6 +92,21 @@ def sha256_file(path: str | Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def chunking_fingerprint(
+    max_chars: int = DEFAULT_MAX_CHARS,
+    *,
+    overlap_chars: int = 0,
+    rule_version: int = _CHUNKING_RULE_VERSION,
+) -> str:
+    """Stable identifier for the current chunking rules.
+
+    Any chunking parameter or algorithm change must change this value, so a
+    re-import under new rules is not silently skipped by SHA-256 dedup.
+    """
+    payload = f"v{rule_version}:max={max_chars}:overlap={overlap_chars}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _printable_ratio(text: str) -> float:
@@ -254,7 +276,7 @@ def chunk_page_text(
 
         # Oversized single paragraph: split on sentence boundaries.
         if buffer_len >= max_chars * 2 and len(buffer) == 1:
-            sentences = re.split(r"(?<=[.!?])\s+", para)
+            sentences = _SENTENCE_SPLIT_RE.split(para)
             buffer, buffer_len = [], 0
             for sentence in sentences:
                 sentence = sentence.strip()
@@ -380,6 +402,7 @@ def ingest_pdf(
         quality_counts=dict(quality_counts),
         chunk_count=len(all_chunks),
         warnings=warnings,
+        chunking_fingerprint=chunking_fingerprint(max_chars),
     )
     return source, all_chunks, report
 

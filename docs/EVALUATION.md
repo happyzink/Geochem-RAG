@@ -1,6 +1,6 @@
-# GeoChem-RAG 评估与接口说明（Wave 1–2，CODEartsAgent）
+# GeoChem-RAG 评估与接口说明（CODEartsAgent）
 
-状态：**部分完成**。检索、受约束回答、引用校验、拒答、评估脚手架与离线自检已实现并通过 67 项离线测试。双 provider 集成已验证：**嵌入**用 SiliconFlow（`BAAI/bge-m3`，密钥 `SILICONFLOW_API_KEY`），**对话**用 DeepSeek 官方 API（`deepseek-chat`，密钥 `DEEPSEEK_API_KEY`），两套密钥/模型/base URL 独立读取。真实「问题→检索→回答→引用」全链路已于 2026-09-28 跑通（见 §3、§7.1、`eval/results/online_e2e_20260928T112233Z.json`）。dense/hybrid 同条件对照因运行环境沙箱间歇屏蔽 API 域名而未完成批量跑，命令与输出 schema 见 §7，网络恢复后在沙箱外执行即可补齐。**本文未含任何未经复现的提升百分比。**
+状态：**部分完成**。检索、受约束回答、引用校验、拒答、评估脚手架与离线自检已实现并通过 104 项离线测试。双 provider 集成已验证：**嵌入**用 SiliconFlow（`BAAI/bge-m3`，密钥 `SILICONFLOW_API_KEY`），**对话**用 DeepSeek 官方 API（`deepseek-chat`，密钥 `DEEPSEEK_API_KEY`），两套密钥/模型/base URL 独立读取。真实「问题→检索→回答→引用」全链路已于 2026-09-28 跑通（见 §3、§7.1、`eval/results/online_e2e_20260928T112233Z.json`）。dense/hybrid 同条件对照因运行环境沙箱间歇屏蔽 API 域名而未完成批量跑，命令与输出 schema 见 §7，网络恢复后在沙箱外执行即可补齐。**本文未含任何未经复现的提升百分比。**
 
 ## 1. 范围与职责
 
@@ -54,7 +54,11 @@ retriever.retrieve_with_trace(question, mode, top_k) -> RetrievalTrace          
 expand_query(question) -> ExpandedQuery(original, expanded, added_terms, matched_terms)  # 不覆盖原查询
 
 # answering.py
-EvidenceAnswerer(store, chat_provider, *, top_k=5, max_evidence_chars=900, visibility=None).answer(question, hits) -> Answer
+EvidenceAnswerer(store, chat_provider, *, top_k=5, max_evidence_chars=900, visibility=None)
+  .answer(question, hits, *, top_k=5, allow_extended=True) -> Answer
+    # allow_extended=True: 空证据时调用 LLM 生成简短通用背景（标注"未经本地文献核验"），存 meta.extended_explanation
+    # status 仍为 insufficient_evidence，citations 为空
+    # 有证据时：模型若报告无法用证据支持的部分，存 meta.unsupported_aspects
 build_evidence(hits, store, *, top_k=5, visibility=None) -> list[EvidenceItem]
 format_citation(citation) -> str   # "论文标题，PDF 第 N 页"
 
@@ -78,7 +82,18 @@ write_review_sheet(results, path) -> None        # 人工标注模板
 }
 ```
 
-`status` 取值 `answered / insufficient_evidence / error`；`answered` 必有 ≥1 条引用且 `citations ⊆ evidence`；`insufficient_evidence` 不带引用；`error` 不呈现为地学结论。`SearchHit` 字段：`chunk_id, score, rank, retrievers, source_id, pdf_page, dense_score, bm25_score`。
+`status` 取值 `answered / insufficient_evidence / error`；`answered` 必有 ≥1 条引用且 `citations ⊆ evidence`；`insufficient_evidence` 不带引用（可有 `meta.extended_explanation` 通用背景补充，标注"未经本地文献核验"，不构成引用来源）；`error` 不呈现为地学结论。`SearchHit` 字段：`chunk_id, score, rank, retrievers, source_id, pdf_page, dense_score, bm25_score`。
+
+### 4.1 通用背景补充（allow_extended）
+
+当检索无证据（`hits=[]`）且 `allow_extended=True` 时，`answering.py` 用独立的系统提示（`_NO_EVIDENCE_SYSTEM_PROMPT`）调用对话 provider 生成一段简短通用背景解释，存入 `meta.extended_explanation`。该解释：
+
+- 在界面中显示于折叠区"通用背景补充（未经本地文献核验）"，明确标注不是本域文献结论；
+- 不产生引用，`status` 仍为 `insufficient_evidence`；
+- 不添加原文没有的结论、年代、数值或 DOI；
+- provider 出错时 `status=error`，不伪装为成功回答。
+
+`allow_extended=False` 时不调用模型，直接返回拒答文本。有证据时 `allow_extended` 不影响主回答流程；模型若报告部分问题无法用证据支持，存入 `meta.unsupported_aspects`，界面以 warning 展示。
 
 ## 5. 检索策略对比（特点/场景/优缺点）
 

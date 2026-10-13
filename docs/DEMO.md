@@ -1,125 +1,130 @@
-# GeoChem-RAG Demo Guide
+# GeoChem-RAG 演示指南
 
-Status: Wave 3 (QoderCN). This document describes the fixed three-question demo, the architecture diagram, and the recording checklist.
+状态：CODEartsAgent 在线版（2026-10-12）。应用仅联网运行，无离线降级。
 
-## Fixed demo questions
+## 界面布局
 
-The demo runs three questions that exercise different capabilities. The same three questions are hard-coded as preset buttons in the Streamlit UI (`src/geochem_rag/app.py`).
+首页突出问答：
 
-### 1. Cross-language: Chinese question about an English paper
+1. **标题与简短说明**：页面顶部显示"GeoChem-RAG"和一句话描述。
+2. **数据流披露**：用 caption 说明"建索引文本发送至 SiliconFlow 生成向量；提出问题后，问题与命中的证据片段发送至 DeepSeek 生成回答。"
+3. **知识库 / 设置按钮**：两个按钮切换面板，互斥显示。
+   - **知识库**：有效证据块数、来源列表（标题、年份、可见性）、按标题筛选。
+   - **设置**：对话/嵌入模型信息、检索方式（hybrid/dense_only/bm25_only）、top-k 滑块、允许通用背景补充开关。
+4. **示例问题**：折叠区，列出三个中文示例问题。
+5. **聊天界面**：`st.chat_input` 输入框 + `st.chat_message` 历史记录。
+6. **回答渲染**：回答文本 → 尚无论文证据支持的部分（warning）→ 引用卡片（论文标题 + PDF 页码 + 证据片段）→ 通用背景补充（折叠，标注"未经本地文献核验"）。
 
-**Question:** "这篇英文论文如何解释莫根通埃达克质岩体的成因？请用中文概括。"
+默认不显示来源列表和详细配置，保持首页简洁。
 
-**What it tests:** The system retrieves English-language evidence from the Mogetong adakitic pluton paper (Gan et al., 2022, *Frontiers in Earth Science*) and generates an answer in Chinese. This demonstrates cross-language retrieval (Chinese query -> English evidence -> Chinese answer).
+## 推荐演示问题
 
-**Expected behaviour (online mode):**
-- Status: `answered`
-- At least one citation pointing to `src_feart_2022_845763`
-- The answer summarises the thickened-lower-crust partial melting model
-- Query expansion may add terms like "adakitic", "partial melting", "thickened lower crust"
+### 1. 跨语言：中文提问检索英文文献
 
-### 2. Geochemistry abbreviation
+**问题：** "什么是埃达克岩（adakite）？"
 
-**Question:** "MORB 是什么缩写？它在岩石成因讨论中通常指示什么源区？"
+**测试点：** 中文问题 → 术语词典扩展（埃达克岩 → adakite）→ 从英文原文检索证据 → 中文回答 + 英文引用片段。
 
-**What it tests:** The geochemistry abbreviation dictionary in `retrieval.py` expands "MORB" to "mid-ocean ridge basalt" for BM25 retrieval. The system either finds relevant evidence in the loaded corpus or correctly returns `insufficient_evidence` if no paper discusses MORB in detail.
+**预期：**
+- 状态：`answered`（已回答，有本域文献证据）
+- 至少一条引用，含论文标题与 PDF 页码
+- 回答用中文概括，引用展开后显示英文证据片段
 
-**Expected behaviour (online mode):**
-- If the corpus contains MORB discussion: `answered` with citation(s)
-- If the corpus does not cover MORB: `insufficient_evidence` with an explanation
-- The query expansion trace shows the added synonym terms
+### 2. 地化比值与岩浆过程
 
-**Note:** With only the 4 public sample papers, MORB may not be discussed in depth. The system should honestly report insufficient evidence rather than fabricate an answer from general knowledge.
+**问题：** "弧岩浆中 Nb/Ta 比值的变化意味着什么？"
 
-### 3. Unanswerable: outside the corpus
+**测试点：** 化学式/比值保护（Nb/Ta 不被拆分）、地球化学机理检索。
 
-**Question:** "Summarize the conclusions of a paper about kimberlites in Siberia."
+**预期：**
+- 若语料覆盖：`answered`，引用含 Nb/Ta 讨论的证据
+- 若语料未覆盖：`insufficient_evidence`，不编造回答
 
-**What it tests:** No loaded paper discusses Siberian kimberlites. The system must return `insufficient_evidence` and must NOT fabricate an answer or invent a citation.
+### 3. 构造演化时间约束
 
-**Expected behaviour (online mode):**
-- Status: `insufficient_evidence`
-- No citations
-- The answer text explains that the loaded corpus does not contain relevant evidence
+**问题：** "青藏高原地壳增厚主要发生在什么时期？"
 
-## Demo recording checklist
+**测试点：** 中文地名/构造术语检索，时间约束回答。
 
-When recording a demo GIF or video:
+**预期：**
+- 若语料覆盖：`answered`，回答含具体时代/年龄约束
+- 若语料未覆盖：`insufficient_evidence`
 
-1. **Start the app** with at least the 4 public sample papers imported.
-2. **Ask question 1** (cross-language). Expand at least one citation to show:
-   - Paper title
-   - PDF page number
-   - Evidence snippet
-   - "Open original" link (for public sources)
-3. **Verify the PDF page** by opening the cited page in the actual PDF and confirming the evidence snippet matches the source text.
-4. **Ask question 2** (abbreviation). Show the query expansion trace in the UI.
-5. **Ask question 3** (unanswerable). Show the `insufficient_evidence` status and the absence of citations.
-6. **Show the sidebar**: retrieval mode, top-k, source list with public/private distinction, and the privacy notice.
+### 4. 语料外问题（拒答测试）
 
-## Architecture diagram
+**问题：** "Summarize the conclusions of a paper about kimberlites in Siberia."
 
-```
-PDF/ (user's local files)
-  |
-  v
-[ingest.py] -- page-by-page text extraction, quality tagging
-  |
-  v
-[store.py] -- JSONL persistence, SHA-256 dedup
-  |
-  +---> [retrieval.py]
-  |       |
-  |       +-- DenseIndex (cosine similarity over bge-m3 embeddings)
-  |       +-- BM25Index (lexical + geochemistry term expansion)
-  |       +-- RRF fusion (k=60)
-  |       |
-  |       v
-  |     Top-5 SearchHits
-  |       |
-  |       v
-  +---> [answering.py]
-          |
-          +-- build_evidence() resolves chunk_ids to EvidenceItems
-          +-- Prompt: system constraint + evidence blocks + question
-          +-- Chat provider (DeepSeek / SiliconFlow / offline template)
-          +-- Citation validation: every cited chunk_id must be in evidence
-          |
-          v
-        Answer (status, text, citations, evidence)
-          |
-          v
-        [app.py] Streamlit UI
-          |
-          +-- Answer status banner (answered / insufficient / error)
-          +-- Citation cards: title, PDF page, evidence snippet, open-original link
-          +-- Public vs private source badges
-          +-- Privacy notice: evidence fragments sent to online API
-```
+**测试点：** 语料中无西伯利亚金伯利岩论文，系统必须拒答，不编造引用。
 
-## Offline demo mode
+**预期：**
+- 状态：`insufficient_evidence`
+- 无引用
+- 回答说明本地语料未覆盖该主题
 
-When no API key is configured, the app falls back to deterministic stand-in providers:
+## 启动方式
 
-- `HashingEmbedder` (128-dim bag-of-hashed-tokens) for embeddings
-- `TemplateChatProvider` (cites the first evidence id, no real language understanding)
+完成首次配置（`.env` 填入两套密钥 + 导入 PDF + 构建索引）后：
 
-This mode is useful for UI smoke tests and conference demos. Answers are placeholder text and do NOT reflect real retrieval quality. The sidebar clearly shows "Offline demo mode" and a warning that no data is sent externally.
+**Windows 双击启动：** 双击项目根目录的 `启动GeoChem-RAG.bat`。脚本自动加载 `.env`、校验配置、启动 Streamlit 并打开浏览器。重复双击会复用已运行的实例。
 
-## Demo script (automated)
-
-A non-interactive demo script can be run to verify the three questions produce the expected statuses:
+**命令行启动：**
 
 ```powershell
-# Windows PowerShell
-$env:PYTHONPATH = "src"
-$env:PYTHONIOENCODING = "utf-8"
-.\.venv\Scripts\python.exe scripts\run_demo.py
+# Windows
+.\.venv\Scripts\python.exe scripts\run_streamlit_online.py
 ```
 
 ```bash
 # Linux / git-bash
-PYTHONPATH=src PYTHONIOENCODING=utf-8 .venv/bin/python scripts/run_demo.py
+.venv/bin/python scripts/run_streamlit_online.py
 ```
 
-The script prints each question, the answer status, and citation count. It exits 0 if all three questions return the expected status pattern.
+**停止：** 在运行终端按 `Ctrl+C`，或直接关闭终端窗口。
+
+## 演示录制清单
+
+1. 启动应用，确认首页只显示标题、说明、知识库/设置按钮和聊天输入框。
+2. 点击"知识库"按钮，展示来源列表和有效证据块数。再次点击收起。
+3. 提问示例 1，展开至少一条引用，展示论文标题、PDF 页码和证据片段。
+4. 提问示例 4（语料外），展示 `insufficient_evidence` 状态和无引用。
+5. 点击"设置"按钮，展示检索方式、top-k 和通用背景补充开关。
+
+## 架构图
+
+```
+PDF/ (用户本地文件，gitignore)
+  |
+  v
+[ingest.py] — 逐页文本抽取、中英文句界分块、质量标记
+  |
+  v
+[store.py] — JSONL 持久化、SHA-256 去重、chunking fingerprint
+  |
+  +---> [retrieval.py]
+  |       |
+  |       +-- DenseIndex (bge-m3 余弦相似度，SiliconFlow 嵌入)
+  |       +-- BM25Index (词法 + 地学缩写/术语扩展)
+  |       +-- RRF 融合 (k=60)
+  |       +-- from_store 过滤 garbled/scanned/过短块
+  |       |
+  |       v
+  |     Top-k SearchHits
+  |       |
+  |       v
+  +---> [answering.py]
+          |
+          +-- build_evidence() 解析 chunk_id → EvidenceItem
+          +-- 系统提示约束 + 证据块 + 问题 → DeepSeek 对话
+          +-- 引用校验：每个 chunk_id 必须在证据中
+          +-- 空证据 + allow_extended → 通用背景补充（标注未经核验）
+          |
+          v
+        Answer (status, text, citations, meta)
+          |
+          v
+        [app.py] Streamlit 界面（仅联网）
+          |
+          +-- 知识库按钮 → 来源列表
+          +-- 设置按钮 → 检索/模型/补充配置
+          +-- 聊天界面 → 回答 + 引用卡片 + 通用背景补充
+```

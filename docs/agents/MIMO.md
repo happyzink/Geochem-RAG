@@ -1,5 +1,7 @@
 # MIMO 执行任务书
 
+> 2026-10-12：归档为历史交接资料，后续工作全部转交 CODEartsAgent，不再向 MIMO 派新任务。以下旧范围限制不约束 CODEartsAgent。当前入口：`docs/agents/CODEartsAgent.md`。
+
 状态：此前的 Wave 0 初版已交付；用户现要求只用本地文献。继续工作时先读根目录 `AGENTS.md`、`docs/PROJECT_BRIEF.md` 与 `docs/EXECUTION_PLAN.md`。
 
 ## 负责范围
