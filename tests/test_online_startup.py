@@ -64,9 +64,41 @@ def test_cache_model_mismatch_is_reported(tmp_path: Path):
 
 
 def test_prerequisites_pass_when_ready(tmp_path: Path):
-    store = _store_with_chunks(tmp_path)
+    import hashlib
+    import json
+
+    chunk_text = "Adakite forms by partial melting of thickened lower crust."
+    text_hash = hashlib.sha256(chunk_text.encode("utf-8")).hexdigest()[:16]
+
+    store = tmp_path / "store"
+    store.mkdir()
+    chunk = {
+        "chunk_id": "chk_p0001_c000",
+        "source_id": "src_test",
+        "pdf_page": 1,
+        "text": chunk_text,
+        "section": "intro",
+        "quality": "ok",
+        "chunk_index": 0,
+        "sha256": "ab" * 32,
+    }
+    (store / "chunks.jsonl").write_text(json.dumps(chunk) + "\n", encoding="utf-8")
+
     cache = tmp_path / "emb.json"
-    cache.write_text('{"model": "BAAI/bge-m3", "entries": {}}', encoding="utf-8")
+    cache.write_text(
+        json.dumps(
+            {
+                "model": "BAAI/bge-m3",
+                "entries": {
+                    "chk_p0001_c000": {
+                        "text_hash": text_hash,
+                        "vector": [0.1, 0.2, 0.3],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     errors = mod.check_prerequisites(str(store), str(cache), root=ROOT, env=_env())
     assert errors == []
 
@@ -87,5 +119,21 @@ def test_load_env_missing_file_is_noop(tmp_path: Path):
 
 
 def test_resolve_cache_selects_full_corpus_file():
-    assert "embeddings_full.json" in mod.resolve_cache("data/private/full_corpus")
-    assert "embeddings.json" in mod.resolve_cache("data/processed")
+    assert "embeddings_full.json" in mod.resolve_cache("data/private/full_corpus", env={})
+    assert "embeddings.json" in mod.resolve_cache("data/processed", env={})
+    assert "embeddings_geoscience_20261014.json" in mod.resolve_cache(
+        "data/private/geoscience_20261014", env={}
+    )
+
+
+def test_resolve_store_prefers_geoscience_when_present(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("GEOCHEM_STORE", raising=False)
+    geo = ROOT / "data" / "private" / "geoscience_20261014"
+    full = ROOT / "data" / "private" / "full_corpus"
+    resolved = mod.resolve_store(env={})
+    if (geo / "chunks.jsonl").is_file():
+        assert "geoscience_20261014" in resolved
+    elif (full / "chunks.jsonl").is_file():
+        assert "full_corpus" in resolved
+    else:
+        assert resolved == "data/processed"

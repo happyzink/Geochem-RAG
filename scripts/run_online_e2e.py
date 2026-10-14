@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from geochem_rag.answering import EvidenceAnswerer, format_citation  # noqa: E402
+from geochem_rag.answering import EvidenceAnswerer, author_year_citation  # noqa: E402
 from geochem_rag.evaluation import load_questions  # noqa: E402
 from geochem_rag.providers import (  # noqa: E402
     chat_provider_from_env,
@@ -100,8 +100,11 @@ def main() -> int:
         "citations": [
             {
                 "chunk_id": c.chunk_id,
-                "display": format_citation(c),
+                "display": author_year_citation(c),
+                "label": c.label,
                 "title": c.title,
+                "authors": list(c.authors),
+                "year": c.year,
                 "pdf_page": c.pdf_page,
             }
             for c in answer.citations

@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from .answering import EvidenceAnswerer, format_citation
+from .answering import EvidenceAnswerer, author_year_citation
 from .domain import Answer, AnswerStatus, SearchHit
 from .providers import ProviderError
 from .retrieval import Retriever
@@ -166,7 +166,7 @@ def run_question(
         citation_details.append(
             {
                 "chunk_id": citation.chunk_id,
-                "display": format_citation(citation),
+                "display": author_year_citation(citation),
                 "snippet": evidence_entry["snippet"] if evidence_entry else None,
             }
         )

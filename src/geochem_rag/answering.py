@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
+from .citation_display import CitationAuthorInfo, CitationLabeller
 from .domain import Answer, AnswerStatus, Citation, EvidenceChunk, SearchHit, Source
 from .providers import ChatProvider, ProviderError
 from .store import LocalStore
@@ -38,7 +39,12 @@ SYSTEM_PROMPT = (
     "Cite the evidence you use by its chunk id. If the evidence supports only "
     "part of the question, answer that part with citations and explicitly list "
     "which aspects remain unsupported by the evidence. If the evidence supports "
-    "nothing, refuse. Never invent a chunk id, DOI, age, or value. "
+    "nothing, refuse. Never invent a chunk id, DOI, age, or value. In the "
+    "\"answer\" text, place an inline marker of the exact form [[chunk_id]] "
+    "immediately after each statement the evidence supports, using the chunk "
+    "ids of THIS call only. Do not write author names, years, or any other "
+    "bibliographic text yourself; the application renders the author-year "
+    "citation from verified metadata. "
     "When the question is in Chinese, answer in natural Chinese following "
     "Chinese academic writing conventions: give the direct conclusion first, "
     "then explain the basis, mechanism, and limitations. Use consistent Chinese "
@@ -102,6 +108,10 @@ class EvidenceItem:
     text: str
     section: str | None = None
     quality: str = "ok"
+    authors: list[str] = field(default_factory=list)
+    year: int | None = None
+    doi_or_url: str | None = None
+    local_path: str | None = None
 
     def snippet(self, limit: int = DEFAULT_SNIPPET_CHARS) -> str:
         text = re.sub(r"\s+", " ", self.text).strip()
@@ -117,6 +127,9 @@ class EvidenceItem:
             "pdf_page": self.pdf_page,
             "section": self.section,
             "quality": self.quality,
+            "authors": list(self.authors),
+            "year": self.year,
+            "doi_or_url": self.doi_or_url,
             "snippet": self.snippet(),
         }
 
@@ -124,6 +137,15 @@ class EvidenceItem:
 def format_citation(citation: Citation) -> str:
     """Display form required by the brief: 论文标题，PDF 第 N 页."""
     return f"{citation.title}，PDF 第 {citation.pdf_page} 页"
+
+
+def author_year_citation(citation: Citation) -> str:
+    """Preferred display: the verified author--year label, else title+page.
+
+    Falls back to :func:`format_citation` only when a citation has no verified
+    label (e.g. metadata-missing private sources or older serialized history).
+    """
+    return citation.label or format_citation(citation)
 
 
 def build_evidence(
@@ -152,6 +174,10 @@ def build_evidence(
                 text=chunk.text,
                 section=chunk.section,
                 quality=chunk.quality,
+                authors=list(source.authors) if source else [],
+                year=source.year if source else None,
+                doi_or_url=source.doi_or_url if source else None,
+                local_path=source.local_path if source else None,
             )
         )
     return items
@@ -197,6 +223,91 @@ def _coerce_citation_ids(value: Any) -> list[str]:
             if isinstance(candidate, str):
                 ids.append(candidate.strip())
     return [cid for cid in ids if cid]
+
+
+# Inline author--year marker the model emits right after a supported statement.
+_INLINE_MARKER_RE = re.compile(r"\[\[([^\[\]]+?)\]\]")
+# Free-form author-year strings the model must NOT emit — the program renders
+# these from verified metadata. We reject answers that contain them because
+# the model can invent author names or years.
+_FREE_AUTHOR_YEAR_RE = re.compile(
+    # English free-form author-year: (Fabricated et al., 2099)  /  (A & B, 2020)
+    r"\(\s*[A-Z][A-Za-z'’.\-]+(?:\s+(?:et\s+al|&|[A-Z][A-Za-z'’.\-]+))?"
+    r"\s*(?:,\s*(?:19|20)\d{2})\s*\)",
+    re.IGNORECASE,
+)
+# Model occasionally drops the parentheses entirely: "Fabricated et al., 2099".
+# Matched only when there is NO [[...]] marker anywhere in the text — otherwise
+# inline markers are the correct citation path and we should not flag a label
+# rendered by the application.
+_FREE_AUTHOR_BARE_YEAR_RE = re.compile(
+    r"\b[A-Z][A-Za-z'’.\-]+(?:\s+(?:et\s+al|&|[A-Z][A-Za-z'’.\-]+))?"
+    r"\s*,\s*(?:19|20)\d{2}\b",
+    re.IGNORECASE,
+)
+_FREE_AUTHOR_YEAR_CN_RE = re.compile(
+    # Chinese: （张三等, 2025） / （李四，2020） / 张三等，2025
+    r"(?:[（\(]?[^\）\)]{1,40}?(?:等|及|和|&)\s*[,，]\s*(?:19|20)\d{2}\s*[）\)]?)",
+)
+_FREE_AUTHOR_YEAR_SOLO_RE = re.compile(
+    # Standalone parenthesised author-year when no [[...]] marker exists.
+    r"\(\s*[A-Z][A-Za-z'’.\-]+,\s*(?:19|20)\d{2}\s*\)",
+    re.IGNORECASE,
+)
+
+
+def build_labeller(evidence: Sequence[EvidenceItem]) -> CitationLabeller:
+    """Verified author--year labeller for the evidence sources of one call."""
+    infos = {
+        item.source_id: CitationAuthorInfo(
+            source_id=item.source_id,
+            authors=list(item.authors),
+            year=item.year,
+            title=item.title,
+        )
+        for item in evidence
+    }
+    return CitationLabeller(list(infos.values()))
+
+
+def apply_inline_labels(
+    text: str, chunk_source: Mapping[str, str], labeller: CitationLabeller
+) -> str:
+    """Replace validated ``[[chunk_id]]`` markers with author--year labels.
+
+    Consecutive markers separated only by whitespace (several papers supporting
+    one statement) are merged into a single combined label. Only ids present in
+    ``chunk_source`` are substituted; the caller must reject invalid markers
+    before calling this.
+    """
+    if not text or "[[" not in text:
+        return text
+    result: list[str] = []
+    pending: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        match = _INLINE_MARKER_RE.match(text, i)
+        if match:
+            source_id = chunk_source.get(match.group(1).strip())
+            if source_id:
+                pending.append(source_id)
+            i = match.end()
+            continue
+        if pending:
+            k = i
+            while k < n and text[k] in " \t":
+                k += 1
+            if k < n and _INLINE_MARKER_RE.match(text, k):
+                i = k
+                continue
+            result.append(labeller.label_for_ids(pending))
+            pending = []
+        result.append(text[i])
+        i += 1
+    if pending:
+        result.append(labeller.label_for_ids(pending))
+    return "".join(result)
 
 
 class EvidenceAnswerer:
@@ -328,6 +439,47 @@ class EvidenceAnswerer:
         answer_text = answer_text.strip()
         meta["rejected_citation_ids"] = rejected
 
+        # Inline author--year markers: every id must be in this call's evidence.
+        # An invalid marker is NOT silently dropped (that would leave an
+        # unsupported statement behind); it downgrades the whole answer.
+        inline_ids = [
+            m.group(1).strip() for m in _INLINE_MARKER_RE.finditer(answer_text)
+        ]
+        invalid_markers = [cid for cid in inline_ids if cid not in evidence_ids]
+        meta["inline_marker_ids"] = sorted(set(inline_ids))
+        meta["invalid_inline_markers"] = invalid_markers
+
+        # Four mandatory checks — any failure downgrades the answer to
+        # insufficient_evidence rather than silently dropping bad bits:
+        #
+        # 1. At least one valid inline marker in the answer text. If the model
+        #    skipped markers entirely but citations lists ids, that's an
+        #    inconsistency the application cannot resolve safely.
+        valid_inline_ids = [cid for cid in inline_ids if cid in evidence_ids]
+        no_valid_inline_marker = len(valid_inline_ids) == 0
+
+        # 2. Inline markers ⊆ evidence (already caught as invalid_markers above).
+        # 3. Structured citations ⊆ inline markers. The model may list a valid id
+        #    in citations but never attach any marker in the text — that means
+        #    the user-visible answer carries no verifiable evidence chain.
+        missing_from_text = [cid for cid in valid_ids if cid not in valid_inline_ids]
+
+        # 4. Free-form author-year strings the model invented (no [[...]] marker
+        #    attached) — the application renders labels only from verified
+        #    metadata and never trusts the model's own author/year writing.
+        free_author_year: list[str] = []
+        if not inline_ids:
+            # No inline markers anywhere — flag both parenthesised and bare
+            # forms because there is nothing the application can use to produce
+            # a verifiable author-year label.
+            free_author_year.extend(_FREE_AUTHOR_YEAR_SOLO_RE.findall(answer_text))
+            free_author_year.extend(_FREE_AUTHOR_BARE_YEAR_RE.findall(answer_text))
+            free_author_year.extend(_FREE_AUTHOR_YEAR_CN_RE.findall(answer_text))
+        else:
+            free_author_year.extend(_FREE_AUTHOR_YEAR_RE.findall(answer_text))
+            free_author_year.extend(_FREE_AUTHOR_YEAR_CN_RE.findall(answer_text))
+        meta["free_author_year_matches"] = free_author_year
+
         # Optional fields: unsupported aspects + clearly-separated background.
         raw_unsupported = parsed.get("unsupported_aspects")
         unsupported: list[str] = []
@@ -345,7 +497,26 @@ class EvidenceAnswerer:
 
         model_status = str(parsed.get("status", "")).strip().lower()
 
-        if model_status != AnswerStatus.ANSWERED.value or not valid_ids or not answer_text:
+        reason: str | None = None
+        if invalid_markers:
+            reason = "invalid_inline_marker"
+        elif free_author_year:
+            # Model bypasses the protocol and writes its own author-year text
+            # directly in the answer body — catch this before falling back to
+            # the "no valid inline marker" check below, otherwise a free-form
+            # answer with no markers would be misclassified as a chain gap
+            # rather than a protocol violation.
+            reason = "free_author_year_string"
+        elif no_valid_inline_marker and (valid_ids or rejected or answer_text):
+            reason = "no_valid_inline_marker"
+        elif missing_from_text:
+            reason = "citation_not_in_text"
+        elif model_status != AnswerStatus.ANSWERED.value:
+            reason = "model_refused"
+        elif not valid_ids or not answer_text or rejected:
+            reason = "fabricated_or_missing_citation"
+
+        if reason is not None:
             # The model's text has no valid citation path, so even an apparent
             # refusal may contain unsupported factual claims. Never display it.
             answer_text = "证据不足：模型未给出带有可核验引用的回答。"
@@ -357,12 +528,29 @@ class EvidenceAnswerer:
                 citations=[],
                 evidence=sorted(evidence_ids),
                 question=question,
-                meta={
-                    **meta,
-                    "reason": "fabricated_or_missing_citation"
-                    if rejected or not valid_ids
-                    else "model_refused",
-                },
+                meta={**meta, "reason": reason},
+            )
+
+        # Model cites internal ids; the program renders verified author--year
+        # labels. The model never writes the label text itself.
+        labeller = build_labeller(evidence)
+        chunk_source = {item.chunk_id: item.source_id for item in evidence}
+        answer_text = apply_inline_labels(answer_text, chunk_source, labeller)
+
+        # Final safety net: after program labelling there must be no leftover
+        # literal [[...]] markers that weren't replaced — they indicate an
+        # invalid id the caller didn't catch earlier.
+        leftover = [
+            m.group(1).strip() for m in _INLINE_MARKER_RE.finditer(answer_text)
+        ]
+        if leftover:
+            return Answer(
+                status=AnswerStatus.INSUFFICIENT_EVIDENCE.value,
+                text="证据不足：正文残留未替换的引用标记，未能形成可核验的证据链。",
+                citations=[],
+                evidence=sorted(evidence_ids),
+                question=question,
+                meta={**meta, "reason": "leftover_inline_marker", "leftover_ids": leftover},
             )
 
         citations = [
@@ -371,6 +559,10 @@ class EvidenceAnswerer:
                 source_id=by_id[cid].source_id,
                 title=by_id[cid].title,
                 pdf_page=by_id[cid].pdf_page,
+                authors=list(by_id[cid].authors),
+                year=by_id[cid].year,
+                label=labeller.label_for(by_id[cid].source_id),
+                doi_or_url=by_id[cid].doi_or_url,
             )
             for cid in valid_ids
         ]

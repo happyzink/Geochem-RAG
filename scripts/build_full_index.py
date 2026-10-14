@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -24,6 +25,54 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+
+def index_health(chunks, cache) -> dict:
+    """Coverage / dimension / finiteness check for the vectors about to serve.
+
+    A vector is reusable only when its stored text hash still matches the chunk
+    text. Missing, malformed or non-finite vectors are reported, never assumed
+    complete; mixed dimensions are flagged so a corrupt cache cannot silently
+    serve a wrong-length query space.
+    """
+    covered = 0
+    missing: list[str] = []
+    invalid: list[str] = []
+    dims: set[int] = set()
+    for chunk in chunks:
+        entry = cache._data.get(chunk.chunk_id)
+        if not entry or entry.get("text_hash") != cache._text_hash(chunk.text):
+            missing.append(chunk.chunk_id)
+            continue
+        vector = entry.get("vector")
+        if (
+            not isinstance(vector, list)
+            or not vector
+            or not all(isinstance(value, (int, float)) and math.isfinite(value) for value in vector)
+        ):
+            invalid.append(chunk.chunk_id)
+            continue
+        dims.add(len(vector))
+        covered += 1
+    return {
+        "covered": covered,
+        "total": len(chunks),
+        "missing": missing,
+        "invalid": invalid,
+        "dims": sorted(dims),
+    }
+
+
+def _health_is_pass(health: dict) -> bool:
+    """True when the cache is ready to serve; any other condition must fail."""
+    return (
+        not health["missing"]
+        and not health["invalid"]
+        and len(health["dims"]) == 1
+        and health["dims"][0] > 0
+        and health["covered"] == health["total"]
+        and health["total"] > 0
+    )
 
 
 def load_env() -> None:
@@ -94,6 +143,28 @@ def main() -> int:
     print(f"cache={args.cache} model={model} already={have} missing={len(missing_idx)}")
 
     if not missing_idx:
+        health = index_health(chunks, cache)
+        print(
+            f"index_health covered={health['covered']}/{health['total']} "
+            f"dims={health['dims']} invalid={len(health['invalid'])} "
+            f"missing={len(health['missing'])}"
+        )
+        if not _health_is_pass(health):
+            if health["invalid"]:
+                print(
+                    f"INCOMPLETE: {len(health['invalid'])} invalid / non-finite vectors in cache",
+                    file=sys.stderr,
+                )
+            if health["missing"]:
+                print(
+                    f"INCOMPLETE: {len(health['missing'])} chunks still missing",
+                    file=sys.stderr,
+                )
+            if len(health["dims"]) != 1:
+                print("INCOMPLETE: inconsistent vector dimensions in cache", file=sys.stderr)
+            if health["total"] == 0:
+                print("INCOMPLETE: no chunks to embed", file=sys.stderr)
+            return 5
         print(f"INDEX COMPLETE: {have}/{len(chunks)} vectors")
         return 0
 
@@ -140,12 +211,26 @@ def main() -> int:
             rate = done / elapsed if elapsed else 0
             print(f"  progress {done}/{len(missing_idx)} ({rate:.1f} vec/s)", flush=True)
 
-    total_cached = sum(
-        1
-        for c in chunks
-        if c.chunk_id in cache._data and cache._data[c.chunk_id].get("text_hash") == cache._text_hash(c.text)
+    health = index_health(chunks, cache)
+    print(
+        f"INDEX COMPLETE: {health['covered']}/{health['total']} vectors model={model} "
+        f"dims={health['dims']} invalid={len(health['invalid'])} "
+        f"missing={len(health['missing'])}"
     )
-    print(f"INDEX COMPLETE: {total_cached}/{len(chunks)} vectors model={model}")
+    if not _health_is_pass(health):
+        if health["invalid"]:
+            print(
+                f"INCOMPLETE: {len(health['invalid'])} invalid / non-finite vectors remaining",
+                file=sys.stderr,
+            )
+        if health["missing"]:
+            print(
+                f"INCOMPLETE: {len(health['missing'])} chunks still missing after run",
+                file=sys.stderr,
+            )
+        if len(health["dims"]) != 1:
+            print("INCOMPLETE: inconsistent vector dimensions", file=sys.stderr)
+        return 5
     print(f"CACHE {args.cache}")
     return 0
 

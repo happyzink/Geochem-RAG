@@ -88,7 +88,7 @@ def hit() -> SearchHit:
 
 def test_run_question_records_recall_and_citations(tmp_path):
     store = make_store(tmp_path)
-    chat = StubChat('{"status": "answered", "answer": "加厚下地壳部分熔融。", "citations": ["chk_p0003_c000"]}')
+    chat = StubChat('{"status": "answered", "answer": "加厚下地壳部分熔融[[chk_p0003_c000]]。", "citations": ["chk_p0003_c000"]}')
     answerer = EvidenceAnswerer(store, chat)
     question = {
         "id": "qX",
@@ -102,7 +102,7 @@ def test_run_question_records_recall_and_citations(tmp_path):
     assert result.status == AnswerStatus.ANSWERED.value
     assert result.recall_at_5_source is True
     assert result.recall_at_5_page is True
-    assert result.citation_details[0]["display"] == "Test Paper，PDF 第 3 页"
+    assert result.citation_details[0]["display"] == "(Author, 2022)"
     assert result.retrieved[0]["retrievers"] == ["dense", "bm25"]
 
 
@@ -142,7 +142,7 @@ def test_run_question_retrieval_error(tmp_path):
 
 def test_summarize_and_write_results(tmp_path):
     store = make_store(tmp_path)
-    answered_chat = StubChat('{"status": "answered", "answer": "a", "citations": ["chk_p0003_c000"]}')
+    answered_chat = StubChat('{"status": "answered", "answer": "a[[chk_p0003_c000]]", "citations": ["chk_p0003_c000"]}')
     refuse_chat = StubChat('{"status": "insufficient_evidence", "answer": "no", "citations": []}')
     questions = [
         {"id": "q1", "category": "terminology", "question": "q1", "expected_source_ids": ["src_test"], "expected_pages": [3], "should_refuse": False},
@@ -169,7 +169,7 @@ def test_summarize_and_write_results(tmp_path):
 
 def test_human_labels_are_used_when_present(tmp_path):
     store = make_store(tmp_path)
-    chat = StubChat('{"status": "answered", "answer": "a", "citations": ["chk_p0003_c000"]}')
+    chat = StubChat('{"status": "answered", "answer": "a[[chk_p0003_c000]]", "citations": ["chk_p0003_c000"]}')
     question = {"id": "q1", "category": "t", "question": "q1", "expected_source_ids": ["src_test"], "expected_pages": [3], "should_refuse": False}
     results = run_mode([question], "hybrid", StubRetriever([hit()]), EvidenceAnswerer(store, chat), store)
     labels = tmp_path / "human_labels.jsonl"

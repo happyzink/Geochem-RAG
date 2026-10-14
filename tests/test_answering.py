@@ -92,7 +92,9 @@ def test_missing_chunk_is_skipped(store):
 
 
 def test_answered_maps_citation_to_title_and_page(store):
-    chat = FakeChat(reply='{"status": "answered", "answer": "加厚下地壳部分熔融。", "citations": ["chk_p0003_c000"]}')
+    # Model MUST emit [[chunk_id]] inline markers — this is the single source
+    # of truth for verifiable citations after the P1 chain-consistency fix.
+    chat = FakeChat(reply='{"status": "answered", "answer": "加厚下地壳部分熔融[[chk_p0003_c000]]。", "citations": ["chk_p0003_c000"]}')
     answer = EvidenceAnswerer(store, chat).answer("如何解释？", [make_hit("chk_p0003_c000", page=3)])
     assert answer.status == AnswerStatus.ANSWERED.value
     assert len(answer.citations) == 1
@@ -102,6 +104,53 @@ def test_answered_maps_citation_to_title_and_page(store):
     assert format_citation(citation) == "Test Adakite Paper，PDF 第 3 页"
     assert answer.meta["evidence"][0]["chunk_id"] == "chk_p0003_c000"
     assert answer.meta["evidence"][0]["snippet"]
+
+
+def test_model_omits_inline_marker_but_citations_list_valid_ids_is_rejected(store):
+    # P1 chain consistency — scenario 1 from the review report: model writes
+    # free-form text, citations lists a valid id, but no [[id]] marker appears
+    # in the answer body. The answerer must not accept this as answered.
+    chat = FakeChat(reply='{"status": "answered", "answer": "加厚下地壳部分熔融。", "citations": ["chk_p0003_c000"]}')
+    answer = EvidenceAnswerer(store, chat).answer("q", [make_hit("chk_p0003_c000")])
+    assert answer.status == AnswerStatus.INSUFFICIENT_EVIDENCE.value
+    assert answer.meta["reason"] == "no_valid_inline_marker"
+    assert "chk_p0003_c000" not in answer.text
+
+
+def test_model_free_author_year_string_rejected(store):
+    # P1 chain consistency — scenario 2: model writes its own author-year
+    # text (Fabricated et al., 2099) instead of [[chunk_id]] markers.
+    chat = FakeChat(reply='{"status": "answered", "answer": "Fabricated et al., 2099 提出此观点。", "citations": []}')
+    answer = EvidenceAnswerer(store, chat).answer("q", [make_hit("chk_p0003_c000")])
+    assert answer.status == AnswerStatus.INSUFFICIENT_EVIDENCE.value
+    assert answer.meta["reason"] == "free_author_year_string"
+
+
+def test_model_citations_without_inline_marker_is_rejected(store):
+    # P1 chain consistency — scenario 3: citations lists a valid id, some
+    # invalid ids, and the model also failed to emit any [[...]] marker in
+    # the answer text. The whole answer is rejected, not just bad ids dropped.
+    chat = FakeChat(reply='{"status": "answered", "answer": "结论如下。", "citations": ["chk_p0003_c000", "chk_fabricated"]}')
+    answer = EvidenceAnswerer(store, chat).answer("q", [make_hit("chk_p0003_c000")])
+    assert answer.status == AnswerStatus.INSUFFICIENT_EVIDENCE.value
+    assert answer.meta["reason"] == "no_valid_inline_marker" or answer.meta["reason"] == "fabricated_or_missing_citation"
+    assert "chk_fabricated" in answer.meta["rejected_citation_ids"]
+
+
+def test_citation_id_not_in_text_is_rejected(store):
+    # P1 chain consistency — scenario 4: model emits [[chk_a]] in text but
+    # citations also lists a valid [[chk_b]] id that never appears in text.
+    # Structured citations must be a subset of inline markers.
+    # (Two chunks pre-seeded by the ``store`` fixture.)
+    hit_a = make_hit("chk_p0003_c000", page=3)
+    hit_b = make_hit("chk_p0007_c001", page=7)
+    chat = FakeChat(
+        reply='{"status": "answered", "answer": "支持[[chk_p0003_c000]]。", '
+        '"citations": ["chk_p0003_c000", "chk_p0007_c001"]}'
+    )
+    answer = EvidenceAnswerer(store, chat).answer("q", [hit_a, hit_b])
+    assert answer.status == AnswerStatus.INSUFFICIENT_EVIDENCE.value
+    assert answer.meta["reason"] == "citation_not_in_text"
 
 
 def test_prompt_contains_evidence_id_and_untrusted_rule(store):
@@ -217,3 +266,41 @@ def test_no_evidence_extended_provider_error_is_error(store):
     assert answer.status == AnswerStatus.ERROR.value
     assert answer.citations == []
     assert answer.meta["error"]["kind"] == KIND_TIMEOUT
+
+
+def test_inline_marker_becomes_author_year_label(store):
+    chat = FakeChat(
+        reply='{"status": "answered", "answer": "加厚下地壳部分熔融[[chk_p0003_c000]]。", "citations": ["chk_p0003_c000"]}'
+    )
+    answer = EvidenceAnswerer(store, chat).answer("q", [make_hit("chk_p0003_c000")])
+    assert answer.status == AnswerStatus.ANSWERED.value
+    assert "(Author, 2022)" in answer.text
+    assert "[[chk_p0003_c000]]" not in answer.text
+    citation = answer.citations[0]
+    assert citation.label == "(Author, 2022)"
+    assert citation.authors == ["A. Author"]
+    assert citation.year == 2022
+
+
+def test_consecutive_same_source_markers_merge_to_one_label(store):
+    chat = FakeChat(
+        reply=(
+            '{"status": "answered", "answer": "结论[[chk_p0003_c000]] [[chk_p0007_c001]]。", '
+            '"citations": ["chk_p0003_c000", "chk_p0007_c001"]}'
+        )
+    )
+    answer = EvidenceAnswerer(store, chat).answer(
+        "q", [make_hit("chk_p0003_c000"), make_hit("chk_p0007_c001", rank=2, page=7)]
+    )
+    assert answer.text == "结论(Author, 2022)。"
+
+
+def test_invalid_inline_marker_downgrades_answer(store):
+    chat = FakeChat(
+        reply='{"status": "answered", "answer": "捏造结论[[chk_fabricated]]。", "citations": ["chk_p0003_c000"]}'
+    )
+    answer = EvidenceAnswerer(store, chat).answer("q", [make_hit("chk_p0003_c000")])
+    assert answer.status == AnswerStatus.INSUFFICIENT_EVIDENCE.value
+    assert answer.meta["reason"] == "invalid_inline_marker"
+    assert "chk_fabricated" in answer.meta["invalid_inline_markers"]
+    assert "捏造" not in answer.text

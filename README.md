@@ -6,6 +6,8 @@ Evidence-grounded literature Q&A for rock geochemistry. Retrieves evidence from 
 
 ## 项目状态 / Project Status
 
+> **2026-10-14 审查快照：** 当前 249 项测试通过，但新增输入框模型切换、PDF 上传以及作者元数据迁移仍存在已复现缺陷，尚未通过完整端到端验收。作者—年份显示框架已有，真实来源书目仍需核实与写回。详见 [二次复核与返工](docs/agents/TraeCode二次复核_2026-10-14.md)；本次快照不代表这些功能已可用。
+
 **已实现功能：**
 
 - PDF 逐页文本抽取、质量标记与页内分块（`ingest.py`）

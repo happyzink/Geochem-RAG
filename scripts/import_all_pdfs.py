@@ -16,10 +16,18 @@ Usage (PowerShell, repo root):
   .venv\Scripts\python.exe scripts\import_all_pdfs.py
   .venv\Scripts\python.exe scripts\import_all_pdfs.py --limit 5   # smoke
   .venv\Scripts\python.exe scripts\import_all_pdfs.py --report-only
+
+Allow-list mode (task D/E): pass the geoscience manifest produced by
+scripts/inventory_local_pdfs.py; only ``decision == include`` entries are
+imported and their verified bibliographic fields are attached to the source.
+  .venv\Scripts\python.exe scripts\import_all_pdfs.py \
+      --manifest data\private\traecode_20261014\geoscience_manifest.json \
+      --store data\private\geoscience_20261014 --max-chars 1200
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import sys
@@ -46,6 +54,23 @@ PDF_ROOT = ROOT / "PDF"
 STORE_ROOT = ROOT / "data" / "private" / "full_corpus"
 STATE_PATH = STORE_ROOT / "import_state.json"
 REPORT_PATH = STORE_ROOT / "full_import_report.json"
+# Files deliberately kept out of the retrieval corpus per user instruction
+# (2026-10): geoscience literature only. Matched against the PDF path.
+NON_GEOSCIENCE_PATHS = (
+    "Psychology_Now_Presents",
+    "Time_Special_Edition",
+    "Understanding_Your_Emotions",
+    "Walking in Austria",
+    "Walks and Treks in the Maritime",
+    "Trekking and Climbing in the Indian Himalaya",
+    "Science Research Writing",
+    "understanding-machine-learning-theory",
+)
+
+
+def is_excluded_non_geoscience(rel_path: str) -> bool:
+    lowered = rel_path.lower()
+    return any(key.lower() in lowered for key in NON_GEOSCIENCE_PATHS)
 
 
 def load_state(state_path: Path) -> dict:
@@ -73,11 +98,107 @@ def classify_extract_error(exc: BaseException) -> str:
     return "extract_error"
 
 
-def process_one(pdf: Path, store: LocalStore, state: dict, state_path: Path, max_chars: int = 1200) -> dict:
+def manifest_signature(entry: dict | None, max_chars: int) -> str:
+    """Signature of the manifest decision + verified metadata for one file.
+
+    When it changes (edited allow-list or corrected bibliographic fields) the
+    SHA-based resume must reprocess the file instead of skipping it, so metadata
+    updates are never lost just because the bytes are unchanged.
+    """
+    if entry is None:
+        return "legacy"
+    payload = json.dumps(
+        {
+            "decision": entry.get("decision"),
+            "title": entry.get("title"),
+            "title_is_filename": entry.get("title_is_filename"),
+            "authors": entry.get("authors"),
+            "year": entry.get("year"),
+            "doi_or_url": entry.get("doi_or_url"),
+            "chunking": chunking_fingerprint(max_chars),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def manifest_action(rel: str, manifest: dict | None) -> tuple[str, str, str | None]:
+    """Classify one relative path against the allow-list.
+
+    Returns ``(action, reason, decision)`` where action is ``import`` or
+    ``exclude``. Under ``--manifest`` a file that is absent, ``exclude`` or
+    ``uncertain`` never enters the store, BM25 set, vector index or neighbouring
+    evidence. With ``manifest is None`` the legacy filename blacklist still
+    applies (``legacy`` action is resolved by the caller).
+    """
+    if manifest is None:
+        return "legacy", "", None
+    entry = manifest.get(rel)
+    if entry is None:
+        return "exclude", "文件不在允许清单中（--manifest 模式）", None
+    decision = entry.get("decision")
+    if decision != "include":
+        reason = f"清单判定为 {decision}：{entry.get('reason', '')}".strip("：")
+        return "exclude", reason, decision
+    return "import", "", decision
+
+
+def process_one(
+    pdf: Path,
+    store: LocalStore,
+    state: dict,
+    state_path: Path,
+    max_chars: int = 1200,
+    manifest: dict | None = None,
+) -> dict:
     rel = pdf.relative_to(ROOT).as_posix()
+    entry = manifest.get(rel) if manifest is not None else None
+
+    if manifest is not None:
+        # Allow-list mode: the manifest decides eligibility.
+        action, reason, decision = manifest_action(rel, manifest)
+        if action == "exclude":
+            digest = sha256_file(pdf)
+            removed = 0
+            # Clean up stale store entry from a previous import when the
+            # manifest now excludes this file. Keeps the active retrieval
+            # set strictly aligned with the manifest.
+            existing = next(
+                (s for s in store.load_sources() if s.sha256 == digest), None
+            )
+            if existing is not None:
+                removed = store.delete_source(existing.source_id)
+            return {
+                "path": rel,
+                "filename": pdf.name,
+                "sha256": digest,
+                "status": "excluded",
+                "excluded_reason": reason,
+                "manifest_decision": decision,
+                "chunk_count": removed,
+                "removed_from_store": removed > 0,
+                "resumed": False,
+            }
+    elif is_excluded_non_geoscience(rel):
+        # Never imported; the exclusion is recorded so later runs skip it too.
+        return {
+            "path": rel,
+            "filename": pdf.name,
+            "sha256": sha256_file(pdf),
+            "status": "excluded",
+            "excluded_reason": "非地学内容，按用户指示不纳入检索语料",
+            "chunk_count": 0,
+            "resumed": True,
+        }
     digest = sha256_file(pdf)
+    sig = manifest_signature(entry, max_chars)
     prior = state["by_sha"].get(digest)
-    if prior and prior.get("status") in {"imported", "skipped_failure"}:
+    if (
+        prior
+        and prior.get("status") in {"imported", "skipped_failure"}
+        and prior.get("manifest_sig", "legacy") == sig
+    ):
         # Older state files did not retain page quality. Recover it from the
         # local PDF without importing/changing its already stored chunks.
         if prior.get("status") == "imported" and "quality_counts" not in prior:
@@ -131,11 +252,26 @@ def process_one(pdf: Path, store: LocalStore, state: dict, state_path: Path, max
                 }
             )
             state["failures"].append({"path": rel, "kind": kind, "error": row["error"]})
-            state["by_sha"][digest] = {**row, "status": "skipped_failure"}
+            state["by_sha"][digest] = {**row, "status": "skipped_failure", "manifest_sig": sig}
             save_state(state, state_path)
             return row
 
-        source, chunks, report = ingest_pdf(pdf, visibility="private", max_chars=max_chars)
+        if entry is not None:
+            # Verified bibliographic fields from the allow-list; a filename-only
+            # title stays a placeholder rather than masquerading as verified.
+            ingest_title = None if entry.get("title_is_filename") else entry.get("title")
+            ingest_authors = entry.get("authors") or []
+            source, chunks, report = ingest_pdf(
+                pdf,
+                title=ingest_title,
+                authors=ingest_authors,
+                year=entry.get("year"),
+                doi_or_url=entry.get("doi_or_url"),
+                visibility="private",
+                max_chars=max_chars,
+            )
+        else:
+            source, chunks, report = ingest_pdf(pdf, visibility="private", max_chars=max_chars)
         result = store.import_document(source, chunks, report, chunking_fingerprint=chunking_fingerprint(max_chars))
         quality_counts = dict(report.quality_counts)
         empty_pages = quality_counts.get(PageQuality.EMPTY.value, 0)
@@ -161,7 +297,7 @@ def process_one(pdf: Path, store: LocalStore, state: dict, state_path: Path, max
                 "duplicate_of": prior.get("path") if prior else None,
             }
         )
-        state["by_sha"][digest] = {**row, "status": "imported"}
+        state["by_sha"][digest] = {**row, "status": "imported", "manifest_sig": sig}
         save_state(state, state_path)
         return row
     except Exception as exc:  # noqa: BLE001
@@ -186,7 +322,22 @@ def main() -> int:
     parser.add_argument("--store", default=str(STORE_ROOT), help="store directory")
     parser.add_argument("--reset-state", action="store_true", help="ignore previous state (keep store)")
     parser.add_argument("--max-chars", type=int, default=1200, help="page-local chunk max chars")
+    parser.add_argument(
+        "--manifest",
+        default=None,
+        help="allow-list manifest JSON; only decision==include entries are imported",
+    )
     args = parser.parse_args()
+
+    manifest: dict | None = None
+    if args.manifest:
+        manifest_path = Path(args.manifest)
+        if not manifest_path.is_file():
+            print(f"missing manifest: {manifest_path}", file=sys.stderr)
+            return 2
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = {e["relative_path"]: e for e in payload.get("entries", [])}
+        print(f"manifest mode: {len(manifest)} entries from {manifest_path}", flush=True)
 
     store_root = Path(args.store)
     state_path = store_root / "import_state.json"
@@ -214,7 +365,7 @@ def main() -> int:
 
     rows = []
     for i, pdf in enumerate(pdfs, start=1):
-        row = process_one(pdf, store, state, state_path, max_chars=args.max_chars)
+        row = process_one(pdf, store, state, state_path, max_chars=args.max_chars, manifest=manifest)
         rows.append(row)
         status = row.get("status")
         extra = ""
@@ -256,6 +407,16 @@ def main() -> int:
         "imported_this_run": sum(1 for r in rows if not r.get("resumed") and r.get("status") in {"imported", "already_exists", "replaced", "metadata_updated"}),
         "resumed_this_run": sum(1 for r in rows if r.get("resumed")),
         "failed_this_run": sum(1 for r in rows if r.get("status") == "failed"),
+        "excluded_non_geoscience": sum(1 for r in rows if r.get("status") == "excluded"),
+        "manifest": args.manifest,
+        "manifest_mode": manifest is not None,
+        "manifest_included": sum(1 for r in rows if r.get("status") in {"imported", "already_exists", "replaced", "metadata_updated", "rechunked"}),
+        "manifest_excluded": sum(
+            1 for r in rows if r.get("status") == "excluded" and manifest is not None
+        ),
+        "manifest_excluded_paths": [
+            r["path"] for r in rows if r.get("status") == "excluded" and manifest is not None
+        ],
         "files": rows,
         "state_file": str(state_path),
     }

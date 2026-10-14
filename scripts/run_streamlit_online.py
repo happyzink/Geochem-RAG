@@ -58,14 +58,24 @@ def resolve_store(root: Path = ROOT, env: dict[str, str] | None = None) -> str:
     env = os.environ if env is None else env
     if env.get("GEOCHEM_STORE"):
         return env["GEOCHEM_STORE"]
+    # Prefer the rebuilt geoscience library; full_corpus stays a rollback snapshot.
+    geo = root / "data" / "private" / "geoscience_20261014"
+    if (geo / "chunks.jsonl").is_file():
+        return geo.as_posix()
     full = root / "data" / "private" / "full_corpus"
     if (full / "chunks.jsonl").is_file():
         return full.as_posix()
     return "data/processed"
 
 
-def resolve_cache(store: str) -> str:
-    if "full_corpus" in store.replace("\\", "/"):
+def resolve_cache(store: str, env: dict[str, str] | None = None) -> str:
+    env = os.environ if env is None else env
+    if env.get("GEOCHEM_INDEX_CACHE"):
+        return env["GEOCHEM_INDEX_CACHE"]
+    normalized = store.replace("\\", "/")
+    if "geoscience_20261014" in normalized:
+        return "data/index/embeddings_geoscience_20261014.json"
+    if "full_corpus" in normalized:
         return "data/index/embeddings_full.json"
     return "data/index/embeddings.json"
 
@@ -89,29 +99,76 @@ def check_prerequisites(
     chunks_path = store_path / "chunks.jsonl"
     if not chunks_path.is_file():
         errors.append(f"无语料：未找到 {chunks_path}，请先运行 scripts/import_all_pdfs.py")
-    else:
-        try:
-            chunk_count = sum(1 for _ in open(chunks_path, encoding="utf-8"))
-        except OSError:
-            chunk_count = 0
-        if chunk_count == 0:
-            errors.append(f"无语料：{chunks_path} 为空，请先运行 scripts/import_all_pdfs.py")
+        return errors  # no chunks to verify cache against
+
+    try:
+        chunk_count = sum(1 for _ in open(chunks_path, encoding="utf-8"))
+    except OSError:
+        chunk_count = 0
+    if chunk_count == 0:
+        errors.append(f"无语料：{chunks_path} 为空，请先运行 scripts/import_all_pdfs.py")
+        return errors
 
     cache_path = Path(root) / cache if not Path(cache).is_absolute() else Path(cache)
     expected_model = env.get("GEOCHEM_EMBEDDING_MODEL", "BAAI/bge-m3")
     if not cache_path.is_file():
         errors.append(f"索引不完整：未找到 {cache}，请先运行 scripts/build_full_index.py")
-    else:
-        try:
-            payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            payload = {}
-        model = payload.get("model") if isinstance(payload, dict) else None
-        if model != expected_model:
+        return errors
+
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        errors.append(f"索引损坏：{cache} 无法解析")
+        return errors
+
+    model = payload.get("model") if isinstance(payload, dict) else None
+    if model != expected_model:
+        errors.append(
+            f"索引模型不匹配：{cache} 的 model={model!r}，期望 {expected_model!r}。"
+            "请删除该缓存后重新运行 scripts/build_full_index.py"
+        )
+        return errors
+
+    # Full health check against the actual store — must not silently serve a
+    # partial or corrupt cache (NaN vectors, mixed dimensions, missing blocks).
+    try:
+        from geochem_rag.providers import ProviderConfig, SiliconFlowClient  # noqa: F401
+        from geochem_rag.retrieval import EmbeddingCache
+        from geochem_rag.store import LocalStore
+
+        store_obj = LocalStore(store)
+        all_chunks = store_obj.get_chunks()
+        embeddable = [
+            c for c in all_chunks if c.quality == "ok" and len(c.text.strip()) >= 40
+        ]
+        cache_obj = EmbeddingCache(cache_path, expected_model)
+        import importlib.util as _ilu
+
+        _bfi_path = ROOT / "scripts" / "build_full_index.py"
+        _bfi_spec = _ilu.spec_from_file_location("_bfi", _bfi_path)
+        _bfi_mod = _ilu.module_from_spec(_bfi_spec)
+        assert _bfi_spec.loader is not None
+        _bfi_spec.loader.exec_module(_bfi_mod)
+        index_health = _bfi_mod.index_health
+        _health_is_pass = _bfi_mod._health_is_pass
+
+        health = index_health(embeddable, cache_obj)
+        if not _health_is_pass(health):
+            reasons = []
+            if health["missing"]:
+                reasons.append(f"{len(health['missing'])} 块缺失")
+            if health["invalid"]:
+                reasons.append(f"{len(health['invalid'])} 无效/非有限向量")
+            if len(health["dims"]) != 1:
+                reasons.append(f"维度不一致 {health['dims']}")
+            if health["total"] == 0:
+                reasons.append("无可嵌入块")
             errors.append(
-                f"索引模型不匹配：{cache} 的 model={model!r}，期望 {expected_model!r}。"
+                f"索引健康检查失败：{'、'.join(reasons)}。"
                 "请删除该缓存后重新运行 scripts/build_full_index.py"
             )
+    except Exception as exc:  # noqa: BLE001 — surface, don't hide
+        errors.append(f"索引校验出错：{exc}")
 
     return errors
 

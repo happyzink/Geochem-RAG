@@ -216,12 +216,24 @@ class SearchHit:
 
 @dataclass(frozen=True)
 class Citation:
-    """A display citation resolved from an evidence chunk id."""
+    """A display citation resolved from an evidence chunk id.
+
+    ``label`` is the deterministic author-year display tag (e.g.
+    ``(Luan et al., 2025)``). ``authors``/``year`` carry the verified
+    bibliographic values the label is built from; for private sources with
+    unknown metadata they stay empty/None and the label falls back to a
+    short title with an explicit "待核实" marker. All three default so that
+    older serialized citations (chunk_id..pdf_page only) still load.
+    """
 
     chunk_id: str
     source_id: str
     title: str
     pdf_page: int
+    authors: list[str] = field(default_factory=list)
+    year: int | None = None
+    label: str | None = None
+    doi_or_url: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "chunk_id", _require_str(self.chunk_id, "chunk_id"))
@@ -229,6 +241,21 @@ class Citation:
         object.__setattr__(self, "title", _require_str(self.title, "title"))
         if not isinstance(self.pdf_page, int) or self.pdf_page < 1:
             raise ValueError("pdf_page must be an int starting at 1")
+        if not isinstance(self.authors, list):
+            raise ValueError("authors must be a list[str]")
+        object.__setattr__(
+            self, "authors", [_require_str(a, "author") for a in self.authors]
+        )
+        if self.year is not None and (
+            not isinstance(self.year, int)
+            or isinstance(self.year, bool)
+            or not (1800 <= self.year <= 2100)
+        ):
+            raise ValueError("year must be an int in 1800..2100 or None")
+        if self.label is not None:
+            object.__setattr__(self, "label", _require_str(self.label, "label"))
+        if self.doi_or_url is not None:
+            object.__setattr__(self, "doi_or_url", _require_str(self.doi_or_url, "doi_or_url"))
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -13,6 +13,7 @@ incomplete/mismatched index are surfaced as clear errors, never as a fake answer
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -36,6 +37,7 @@ from geochem_rag.answering import (  # noqa: E402
     format_citation,
 )
 from geochem_rag.domain import AnswerStatus, Citation, Source  # noqa: E402
+from geochem_rag.scientific_text import safe_markdown  # noqa: E402
 from geochem_rag.model_settings import (  # noqa: E402
     APP_PRESETS,
     ChatSettings,
@@ -44,6 +46,10 @@ from geochem_rag.model_settings import (  # noqa: E402
     PROVIDER_SILICONFLOW,
     UNKNOWN_CAPABILITY,
     find_model,
+    load_settings_file,
+    preset_api_description,
+    save_settings_file,
+    selectable_presets,
 )
 from geochem_rag.providers import (  # noqa: E402
     ProviderError,
@@ -76,6 +82,11 @@ _TEST_PROMPT = "请只回复两个汉字：正常"
 def _resolve_store() -> str:
     if os.environ.get("GEOCHEM_STORE"):
         return os.environ["GEOCHEM_STORE"]
+    # The rebuilt geoscience library is the default when present; the old
+    # full_corpus store is kept as a rollback snapshot (see the switch report).
+    geo = _REPO / "data" / "private" / "geoscience_20261014"
+    if (geo / "chunks.jsonl").is_file():
+        return geo.as_posix()
     full = _REPO / "data" / "private" / "full_corpus"
     if (full / "chunks.jsonl").is_file():
         return full.as_posix()
@@ -83,11 +94,14 @@ def _resolve_store() -> str:
 
 
 def _resolve_cache(store_root: str) -> str:
-    return (
-        "data/index/embeddings_full.json"
-        if "full_corpus" in store_root.replace("\\", "/")
-        else "data/index/embeddings.json"
-    )
+    if os.environ.get("GEOCHEM_INDEX_CACHE"):
+        return os.environ["GEOCHEM_INDEX_CACHE"]
+    normalized = store_root.replace("\\", "/")
+    if "geoscience_20261014" in normalized:
+        return "data/index/embeddings_geoscience_20261014.json"
+    if "full_corpus" in normalized:
+        return "data/index/embeddings_full.json"
+    return "data/index/embeddings.json"
 
 
 def _cache_model(path: str) -> str | None:
@@ -198,6 +212,308 @@ def _rebuild_chat(settings: ChatSettings) -> None:
         top_k=5,
         model_meta=model_meta,  # type: ignore[arg-type]
     )
+
+
+def _apply_settings(settings: ChatSettings) -> None:
+    """Persist + rebuild chat client when settings change from the composer bar."""
+    save_settings_file(_SETTINGS_FILE, settings)
+    _rebuild_chat(settings)
+
+
+def _render_composer() -> None:
+    """Chat input + model/thinking selector + PDF upload entry on the bottom bar.
+
+    Model/thinking selectors live outside the ``st.form`` so that changing them
+    applies immediately (Streamlit forms defer widget values until submit). The
+    question text area + buttons are inside the form so Enter/Ctrl+Enter submits.
+    """
+    catalog = st.session_state.get("catalog")
+    settings: ChatSettings = st.session_state.chat_settings
+    capability = _capability_for(settings, catalog.models if catalog else [])
+
+    # --- Model + thinking row (outside form — immediate apply) -------------
+    col_model, col_think, _ = st.columns([2.2, 2, 8])
+    with col_model:
+        model_ids = (
+            [m.id for m in catalog.models]
+            if catalog and catalog.models
+            else []
+        )
+        if settings.model_id and settings.model_id not in model_ids:
+            model_ids = [settings.model_id, *model_ids]
+        if not model_ids:
+            model_ids = [settings.model_id]
+        model_labels = {
+            mid: _model_option_label(mid, catalog, settings) for mid in model_ids
+        }
+        st.selectbox(
+            "模型",
+            options=model_ids,
+            index=(
+                model_ids.index(settings.model_id)
+                if settings.model_id in model_ids
+                else 0
+            ),
+            key="_composer_model_sel",
+            label_visibility="collapsed",
+            format_func=lambda mid: model_labels.get(mid, mid),
+        )
+    with col_think:
+        presets = selectable_presets(capability)
+        thinking_options: list[str] = ["关闭"] + list(presets)
+        if not thinking_options:
+            thinking_options = ["关闭"]
+        if settings.thinking_enabled and settings.level in presets:
+            think_idx = thinking_options.index(settings.level)
+        else:
+            think_idx = 0
+        st.selectbox(
+            "思考",
+            options=thinking_options,
+            index=think_idx,
+            key="_composer_think_sel",
+            label_visibility="collapsed",
+            format_func=(
+                lambda v: NATIVE_LABELS.get(v, v) if v != "关闭" else "关闭"
+            ),
+            disabled=not presets,
+        )
+
+    # --- Apply settings when selectboxes changed ---------------------------
+    new_model = st.session_state.get("_composer_model_sel")
+    if new_model and new_model != settings.model_id:
+        new_cap = _capability_for(
+            replace(settings, model_id=new_model),
+            catalog.models if catalog else [],
+        )
+        new_settings = replace(
+            settings,
+            model_id=new_model,
+            provider=_provider_for_model(new_model, catalog),
+        )
+        if not selectable_presets(new_cap) and new_settings.thinking_enabled:
+            new_settings = replace(new_settings, thinking_enabled=False)
+        _apply_settings(new_settings)
+        st.rerun()
+
+    selected_think = st.session_state.get("_composer_think_sel")
+    if selected_think == "关闭" and settings.thinking_enabled:
+        _apply_settings(replace(settings, thinking_enabled=False))
+        st.rerun()
+    elif (
+        selected_think
+        and selected_think != "关闭"
+        and (not settings.thinking_enabled or settings.level != selected_think)
+    ):
+        _apply_settings(replace(settings, thinking_enabled=True, level=selected_think))
+        st.rerun()
+
+    # --- Input form ---------------------------------------------------------
+    with st.form(key="_composer_form"):
+        question = st.text_area(
+            "Ask about local geochemistry papers…",
+            height=100,
+            key="_composer_question",
+            label_visibility="collapsed",
+            placeholder="Type question here…",
+        )
+        _c1, _c2, _c3 = st.columns([1, 10, 1])
+        with _c1:
+            pdf_clicked = st.form_submit_button(
+                "+ PDF", use_container_width=True
+            )
+        with _c3:
+            send_clicked = st.form_submit_button(
+                "Send", use_container_width=True, type="primary"
+            )
+
+    if pdf_clicked:
+        st.session_state.show_pdf_upload = not st.session_state.get(
+            "show_pdf_upload", False
+        )
+
+    if send_clicked and question and question.strip():
+        st.session_state.chat_history.append({"role": "user", "text": question.strip()})
+        with st.spinner("检索证据并生成回答……"):
+            _run_answer(question.strip())
+        st.rerun()
+
+
+def _render_pdf_upload() -> None:
+    """Upload → 分类 → 切块预览 → 用户确认入库 → 增量索引。"""
+    import importlib.util
+
+    from geochem_rag.ingest import (
+        chunking_fingerprint,
+        extract_pages,
+        ingest_pdf,
+        sha256_file,
+    )
+
+    # Classify: import from the scripts module to share real rules.
+    _inv_path = _REPO / "scripts" / "inventory_local_pdfs.py"
+    inv_spec = importlib.util.spec_from_file_location("inventory_local_pdfs", _inv_path)
+    inv_mod = importlib.util.module_from_spec(inv_spec)
+    assert inv_spec.loader is not None
+    inv_spec.loader.exec_module(inv_mod)
+    classify_geoscience = inv_mod.classify_geoscience
+
+    store: LocalStore = st.session_state.store
+    store_root = Path(st.session_state.store_root)
+    upload_dir = _REPO / "PDF" / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    uploaded = st.file_uploader(
+        "选择 PDF 文件（可多选）",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="_pdf_uploader",
+    )
+
+    if not uploaded:
+        st.info(
+            "选择 PDF 后开始处理。已上传文件保存在 PDF/uploads/ 并经地学筛选。"
+            "块文本片段会发送至 SiliconFlow 嵌入服务生成向量；提问时相关证据会发送至对话服务。"
+        )
+        return
+
+    for uf in uploaded:
+        fname = uf.name
+        with st.status(f"处理 {fname}…", expanded=True):
+            st.markdown(f"**{fname}**（{len(uf.getvalue()) / 1024:.1f} KB）")
+
+            # --- Save & dedup ------------------------------------------------
+            safe_name = fname.replace(" ", "_")
+            pdf_path = upload_dir / safe_name
+            counter = 1
+            while pdf_path.exists() and pdf_path.read_bytes() != uf.getvalue():
+                pdf_path = upload_dir / f"{pdf_path.stem}_{counter}{pdf_path.suffix}"
+                counter += 1
+            if not pdf_path.exists():
+                pdf_path.write_bytes(uf.getvalue())
+            digest = sha256_file(pdf_path)
+
+            existing = next((s for s in store.load_sources() if s.sha256 == digest), None)
+            if existing is not None:
+                st.success(
+                    f"已存在相同内容文献：{existing.title}。SHA-256 匹配，跳过重复入库。"
+                )
+                continue
+
+            # --- Parse & classify --------------------------------------------
+            try:
+                pages = extract_pages(pdf_path)
+            except Exception as exc:
+                st.error(f"无法解析 PDF：{exc}")
+                continue
+
+            scan_text = "\n".join(p.text for p in pages if p.quality.value in ("ok",))
+            decision, reason, _ = classify_geoscience(scan_text, fname)
+
+            if decision == "exclude":
+                st.warning(f"**排除（非地学资料）**：{reason}。该文件不会加入知识库。")
+                continue
+
+            # --- Preview chunks ----------------------------------------------
+            max_chars = 1200
+            fp = chunking_fingerprint(max_chars)
+            source, chunks, report = ingest_pdf(
+                pdf_path, visibility="private", max_chars=max_chars
+            )
+
+            ok_pages = [p for p in pages if p.quality.value == "ok"]
+            st.markdown(f"**页数**：{len(pages)}，有效文本页：{len(ok_pages)}")
+            st.markdown(f"**切块预览**：{len(chunks)} 块，默认块长 {max_chars} 字符")
+            if report.failed_pages:
+                st.caption(f"异常页（跳过）：{report.failed_pages}")
+
+            with st.expander("前 3 块预览", expanded=False):
+                for c in chunks[:3]:
+                    st.markdown(
+                        f"- PDF 第 {c.pdf_page} 页 · {c.section or '(未知)'} · {len(c.text)} 字符"
+                    )
+                    st.code(
+                        c.text[:400] + ("…" if len(c.text) > 400 else ""),
+                        language=None,
+                    )
+
+            # --- Confirm ------------------------------------------------------
+            if st.button(
+                f"入库 {fname}", key=f"_ingest_{digest[:12]}", type="primary"
+            ):
+                source = replace(source, local_path=str(pdf_path))
+                store.import_document(source, chunks, report, chunking_fingerprint=fp)
+
+                cache_path = _resolve_cache_for_store(store_root)
+                st.session_state._pdf_ingest_cache = str(cache_path)
+
+                with st.spinner("增量建索引（仅嵌入新增块）……"):
+                    try:
+                        _run_build_index(store_root, cache_path)
+                        st.success(
+                            f"{fname} 已入库并索引完成。刷新页面后即可提问。"
+                        )
+                        st.session_state.chunk_count = store.count_chunks()
+                    except SystemExit as exc:
+                        rc = exc.code if isinstance(exc.code, int) else 1
+                        st.error(
+                            f"索引失败（退出码 {rc}）。块已写入 store 但向量未生成。"
+                            f"请检查 API key 或运行 scripts/build_full_index.py 诊断。"
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        st.error(f"索引异常：{type(exc).__name__}: {exc}")
+
+    st.divider()
+    st.caption(
+        "以上处理仅在本地执行。块文本片段会发送至 SiliconFlow 嵌入服务生成向量；"
+        "提问时相关证据会发送至对话服务。"
+    )
+
+
+def _resolve_cache_for_store(store_root: Path) -> Path:
+    """Mirror scripts/run_streamlit_online.resolve_cache for the current store."""
+    norm = str(store_root).replace("\\", "/")
+    if "geoscience_20261014" in norm:
+        return _REPO / "data" / "index" / "embeddings_geoscience_20261014.json"
+    if "full_corpus" in norm:
+        return _REPO / "data" / "index" / "embeddings_full.json"
+    return _REPO / "data" / "index" / "embeddings.json"
+
+
+def _run_build_index(store_root: Path, cache_path: Path) -> None:
+    """Invoke build_full_index with argv set for this store + cache."""
+    import importlib.util
+    import sys
+
+    _bfi_path = _REPO / "scripts" / "build_full_index.py"
+    bfi_spec = importlib.util.spec_from_file_location("build_full_index", _bfi_path)
+    bfi_mod = importlib.util.module_from_spec(bfi_spec)
+    assert bfi_spec.loader is not None
+    bfi_spec.loader.exec_module(bfi_mod)
+
+    old_argv = sys.argv
+    sys.argv = [
+        "build_full_index.py",
+        "--store",
+        str(store_root),
+        "--cache",
+        str(cache_path),
+    ]
+    try:
+        rc = bfi_mod.main()
+        if rc != 0:
+            raise SystemExit(rc)
+    finally:
+        sys.argv = old_argv
+
+
+def _provider_for_model(model_id: str, catalog) -> str:
+    """Best-effort provider derivation from catalog; defaults to current."""
+    if catalog and catalog.models:
+        for m in catalog.models:
+            if m.id == model_id:
+                return getattr(m, "provider", PROVIDER_DEEPSEEK) or PROVIDER_DEEPSEEK
+    return PROVIDER_DEEPSEEK
 
 
 def _init_session() -> None:
@@ -331,45 +647,147 @@ def _model_caption(meta: dict[str, Any]) -> None:
     )
 
 
-def _render_citation(citation: Citation, evidence_items: list[EvidenceItem], index: int) -> None:
-    snippet = ""
+def _source_local_path(source_id: str, evidence_items: list[EvidenceItem]) -> str | None:
     for item in evidence_items:
-        if item.chunk_id == citation.chunk_id:
-            snippet = item.snippet()
-            break
-    header = f"**[{index + 1}]** {citation.title} —— PDF 第 {citation.pdf_page} 页"
-    with st.expander(header, expanded=False):
-        if snippet:
-            st.markdown("**证据片段：**")
-            st.markdown(f"> {snippet}")
-        st.caption(f"chunk `{citation.chunk_id}`")
+        if item.source_id == source_id and item.local_path:
+            return item.local_path
+    # Fallback: look up the source by source_id, then scan PDF/ for a file
+    # whose sha256 matches. Covers older imports that did not store local_path.
+    store = st.session_state.store
+    source = next((s for s in store.load_sources() if s.source_id == source_id), None)
+    if source is None:
+        return None
+    pdf_root = _REPO / "PDF"
+    if not pdf_root.is_dir():
+        return None
+    for pdf in pdf_root.rglob("*.pdf"):
+        try:
+            if source.sha256 == _sha256_of(pdf):
+                return str(pdf)
+        except OSError:
+            continue
+    return None
+
+
+def _sha256_of(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 16), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _pdf_preview_iframe(path: str, page: int | None = None) -> str:
+    """Return an iframe HTML snippet that embeds the local PDF via data URI.
+
+    The PDF bytes are read once and base64-encoded; ``#page=N`` targets the
+    first cited page. No filesystem path is exposed to the browser — the PDF
+    content is embedded inline so Streamlit's server serves the content without
+    exposing the host path.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return ""
+    try:
+        data = base64.b64encode(p.read_bytes()).decode("ascii")
+    except OSError:
+        return ""
+    anchor = f"#page={page}" if page else ""
+    return (
+        f'<iframe src="data:application/pdf;base64,{data}{anchor}" '
+        f'width="100%" height="680" '
+        f'style="border:1px solid #ccc;border-radius:4px;"></iframe>'
+    )
+
+
+def _evidence_snippet(chunk_id: str, evidence_items: list[EvidenceItem]) -> str:
+    for item in evidence_items:
+        if item.chunk_id == chunk_id:
+            return item.snippet()
+    return ""
+
+
+def _render_citations(citations: list[Citation], evidence_items: list[EvidenceItem]) -> None:
+    """Author--year reference list, de-duplicated by source, page evidence kept."""
+    st.markdown("**引用（论文证据，作者—年份）：**")
+    order: list[str] = []
+    groups: dict[str, list[Citation]] = {}
+    for citation in citations:
+        if citation.source_id not in groups:
+            groups[citation.source_id] = []
+            order.append(citation.source_id)
+        groups[citation.source_id].append(citation)
+
+    for source_id in order:
+        items = groups[source_id]
+        first = items[0]
+        label = first.label or format_citation(first)
+        pages = sorted({c.pdf_page for c in items})
+        header = safe_markdown(f"{label} · {first.title} —— PDF 第 {pages[0]} 页起")
+        with st.expander(header, expanded=False):
+            authors = "、".join(first.authors) if first.authors else "作者未知（未核实）"
+            st.markdown(safe_markdown(f"- 作者：{authors}"))
+            st.markdown(
+                safe_markdown(f"- 年份：{first.year if first.year else '年份未知（未核实）'}")
+            )
+            st.markdown(safe_markdown(f"- 标题：{first.title}"))
+            if first.doi_or_url:
+                st.markdown(safe_markdown(f"- DOI/URL：{first.doi_or_url}"))
+            for citation in items:
+                st.markdown(f"**支持页：PDF 第 {citation.pdf_page} 页**")
+                snippet = _evidence_snippet(citation.chunk_id, evidence_items)
+                if snippet:
+                    # Literal display so digits, signs and symbols are never
+                    # re-parsed as markdown (a lone ``~`` becomes strikethrough).
+                    st.code(snippet, language=None)
+                st.caption(f"证据块 `{citation.chunk_id}`")
+            local_path = _source_local_path(source_id, evidence_items)
+
+            if local_path:
+                try:
+                    pdf_bytes = Path(local_path).read_bytes()
+                    fname = Path(local_path).name
+                    st.markdown(f"**PDF 文件**（共 {len(pdf_bytes)//1024} KB，打开至第 {pages[0]} 页）：")
+                    st.download_button(
+                        f"下载 {fname}",
+                        data=pdf_bytes,
+                        file_name=fname,
+                        mime="application/pdf",
+                        key=f"_dl_{source_id}_{pages[0]}",
+                        use_container_width=True,
+                    )
+                except OSError:
+                    st.caption(f"PDF 文件不可访问：{local_path}")
 
 
 def _render_answer(answer: Any, evidence_items: list[EvidenceItem]) -> None:
-    st.markdown(answer.text)
+    st.markdown(safe_markdown(answer.text))
     _model_caption(answer.meta)
 
     if answer.status == AnswerStatus.ANSWERED.value:
         unsupported = answer.meta.get("unsupported_aspects") or []
         if unsupported:
             st.warning(
-                "**尚无论文证据支持的部分**\n\n" + "\n".join(f"- {item}" for item in unsupported)
+                safe_markdown(
+                    "**尚无论文证据支持的部分**\n\n"
+                    + "\n".join(f"- {item}" for item in unsupported)
+                )
             )
         if answer.citations:
-            st.markdown("**引用（论文证据）：**")
-            for idx, citation in enumerate(answer.citations):
-                _render_citation(citation, evidence_items, idx)
+            _render_citations(answer.citations, evidence_items)
         extended = answer.meta.get("extended_explanation")
         if extended:
             with st.expander("通用背景补充（未经本地文献核验）", expanded=False):
-                st.markdown(extended)
+                st.markdown(safe_markdown(extended))
                 st.caption("以上是一般背景知识，不是本域文献结论，不得当作引用来源。")
 
     elif answer.status == AnswerStatus.INSUFFICIENT_EVIDENCE.value:
         extended = answer.meta.get("extended_explanation")
         if extended:
             with st.expander("通用背景补充（未经本地文献核验）", expanded=False):
-                st.markdown(extended)
+                st.markdown(safe_markdown(extended))
                 st.caption("以上是一般背景知识，不是本域文献结论，不得当作引用来源。")
 
     else:  # error
@@ -399,7 +817,10 @@ def _render_knowledge_base() -> None:
         label = source.title
         if source.title_is_filename:
             label = f"[文件名] {label}"
-        st.markdown(f"- {label}{('（' + str(source.year) + '）') if source.year else ''} · `{source.visibility}`")
+        st.markdown(
+            safe_markdown(f"- {label}{('（' + str(source.year) + '）') if source.year else ''}")
+            + f" · `{source.visibility}`"
+        )
 
 
 def _save_setting(widget_key: str, setting_key: str) -> None:
@@ -839,7 +1260,7 @@ def main() -> None:
     for message in st.session_state.chat_history:
         if message["role"] == "user":
             with st.chat_message("user"):
-                st.markdown(message["text"])
+                st.markdown(safe_markdown(message["text"]))
         else:
             with st.chat_message("assistant"):
                 if message.get("kind") == "error":
@@ -847,13 +1268,14 @@ def main() -> None:
                 else:
                     _render_answer(message["answer"], message.get("evidence", []))
 
-    # Input ------------------------------------------------------------
-    question = st.chat_input("向本域文献语料提问…")
-    if question:
-        st.session_state.chat_history.append({"role": "user", "text": question})
-        with st.spinner("检索证据并生成回答…"):
-            _run_answer(question)
-        st.rerun()
+    # PDF upload panel (collapsible, triggered by the + button) -----------
+    if st.session_state.get("show_pdf_upload", False):
+        with st.expander("添加 PDF 到知识库", expanded=True):
+            _render_pdf_upload()
+        st.divider()
+
+    # Input ----------------------------------------------------------------
+    _render_composer()
 
 
 if __name__ == "__main__":

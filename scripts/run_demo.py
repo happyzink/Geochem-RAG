@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from geochem_rag.answering import EvidenceAnswerer, format_citation  # noqa: E402
+from geochem_rag.answering import EvidenceAnswerer, author_year_citation  # noqa: E402
 from geochem_rag.domain import AnswerStatus  # noqa: E402
 from geochem_rag.offline import HashingEmbedder, TemplateChatProvider  # noqa: E402
 from geochem_rag.providers import (  # noqa: E402
@@ -101,7 +101,7 @@ def main() -> int:
         print(f"Status: {answer.status}")
         if answer.citations:
             for cit in answer.citations:
-                print(f"  Citation: {format_citation(cit)}")
+                print(f"  Citation: {author_year_citation(cit)}")
         print(f"Answer text: {answer.text[:200]}{'...' if len(answer.text) > 200 else ''}")
 
         if trace.expanded_terms:

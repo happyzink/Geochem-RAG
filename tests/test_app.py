@@ -92,13 +92,17 @@ def test_resolve_store_prefers_env(tmp_path, monkeypatch):
     assert _resolve_store() == str(tmp_path / "my_store")
 
 
-def test_resolve_store_falls_back_to_full_corpus(tmp_path, monkeypatch):
+def test_resolve_store_prefers_geoscience_then_full_corpus(monkeypatch):
     monkeypatch.delenv("GEOCHEM_STORE", raising=False)
+    geo = ROOT / "data" / "private" / "geoscience_20261014"
     full = ROOT / "data" / "private" / "full_corpus"
-    if (full / "chunks.jsonl").is_file():
-        assert "full_corpus" in _resolve_store()
+    resolved = _resolve_store()
+    if (geo / "chunks.jsonl").is_file():
+        assert "geoscience_20261014" in resolved
+    elif (full / "chunks.jsonl").is_file():
+        assert "full_corpus" in resolved
     else:
-        assert _resolve_store() == "data/processed"
+        assert resolved == "data/processed"
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +120,13 @@ def test_resolve_cache_default():
 
 def test_resolve_cache_windows_backslash():
     assert "embeddings_full.json" in _resolve_cache("data\\private\\full_corpus")
+
+
+def test_resolve_cache_geoscience(monkeypatch):
+    monkeypatch.delenv("GEOCHEM_INDEX_CACHE", raising=False)
+    assert "embeddings_geoscience_20261014.json" in _resolve_cache(
+        "data/private/geoscience_20261014"
+    )
 
 
 # ---------------------------------------------------------------------------
